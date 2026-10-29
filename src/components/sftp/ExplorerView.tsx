@@ -311,6 +311,10 @@ export function ExplorerView({ sessionId, transport = "sftp", isActive = true }:
   // fall back to the server home dir, then root.
   useEffect(() => {
     (async () => {
+      // Disable refresh/create while home resolution is still pending. A
+      // premature refresh of the initial "/" placeholder can otherwise win
+      // the home-listing race and leave the browser in the wrong directory.
+      setLoading(sessionId, true);
       const sessionState = useSftpStore.getState().sessions.get(sessionId);
       const preserved = sessionState?.currentPath;
       if (preserved && preserved !== "/") {
