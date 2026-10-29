@@ -8,14 +8,9 @@
 //! which keeps progress accounting and cancellation simple.
 
 use std::path::Path;
-use std::sync::Arc;
 
-use russh::client::Handle;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-
-use crate::ssh::handler::SshClientHandler;
 
 use super::wire::{self, ScpMsg};
 use super::{shell_quote, ScpError};
@@ -30,7 +25,7 @@ const DEFAULT_FILE_MODE: u32 = 0o644;
 /// `on_progress` is called with the cumulative byte count after each chunk.
 /// The remote parent directory must already exist (callers handle `mkdir -p`).
 pub async fn upload_file<F>(
-    handle: Arc<Mutex<Handle<SshClientHandler>>>,
+    handle: crate::ssh::handle::SharedHandle,
     local_path: &Path,
     remote_path: &str,
     cancel: &CancellationToken,
@@ -58,7 +53,7 @@ where
 
     // Open a channel and start the remote sink. `-t` = "to" (receive).
     let channel = {
-        let h = handle.lock().await;
+        let h = handle;
         h.channel_open_session()
             .await
             .map_err(|e| ScpError::ChannelError(e.to_string()))?
@@ -107,7 +102,7 @@ where
 
 /// Download one remote file (`remote_path`) to `local_path` via `scp -f`.
 pub async fn download_file<F>(
-    handle: Arc<Mutex<Handle<SshClientHandler>>>,
+    handle: crate::ssh::handle::SharedHandle,
     remote_path: &str,
     local_path: &Path,
     cancel: &CancellationToken,
@@ -129,7 +124,7 @@ pub struct DownloadLimit<'a> {
 /// Preview-only constraints; legacy transfers keep their original API and
 /// behavior. Cancellation also interrupts handshake, header, and EOF waits.
 pub async fn download_file_limited<F: FnMut(u64)>(
-    handle: Arc<Mutex<Handle<SshClientHandler>>>,
+    handle: crate::ssh::handle::SharedHandle,
     remote_path: &str,
     local_path: &Path,
     cancel: &CancellationToken,
@@ -159,21 +154,21 @@ fn check_header_size(size: u64, limit: DownloadLimit<'_>) -> Result<(), ScpError
 }
 
 async fn download_file_inner<F: FnMut(u64)>(
-    handle: Arc<Mutex<Handle<SshClientHandler>>>,
+    handle: crate::ssh::handle::SharedHandle,
     remote_path: &str,
     local_path: &Path,
     cancel: &CancellationToken,
     limit: Option<DownloadLimit<'_>>,
     on_progress: F,
 ) -> Result<(), ScpError> {
-    let channel = {
-        let h = handle.lock().await;
-        h.channel_open_session()
-            .await
-            .map_err(|e| ScpError::ChannelError(e.to_string()))?
-    };
+    let channel = if let Some(scope) = limit.and_then(|limit| limit.scope) {
+        scope.open(handle).await
+    } else {
+        handle.channel_open_session().await
+    }
+    .map_err(|e| ScpError::ChannelError(e.to_string()))?;
     let channel =
-        crate::ssh::channel_scope::ChannelGuard::new(channel, limit.and_then(|l| l.scope));
+        crate::ssh::channel_scope::ChannelGuard::new(channel, limit.and_then(|limit| limit.scope));
     // `-f` = "from" (send). `-p` would also send timestamps; we skip it.
     let cmd = format!("scp -f -- {}", shell_quote(remote_path));
     channel

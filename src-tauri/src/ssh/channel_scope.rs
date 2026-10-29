@@ -21,6 +21,67 @@ impl ChannelScope {
         }
     }
 
+    /// Shield only the SSH channel handshake. russh 0.46 does not close a
+    /// channel if confirmation arrives after its receiver has been dropped.
+    /// The detached task owns that handshake and closes any unclaimed result.
+    /// A per-connection preview permit bounds late openers, without locking
+    /// normal SSH operations. No staging file is owned by this task.
+    pub async fn open(
+        &self,
+        handle: super::handle::SharedHandle,
+    ) -> Result<russh::Channel<russh::client::Msg>, russh::Error> {
+        let cancel = self.cancel.clone();
+        let permit = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(russh::Error::Disconnect),
+            permit = handle.preview_open.clone().acquire_owned() => permit.map_err(|_| russh::Error::Disconnect)?,
+        };
+        let slot = std::sync::Arc::new(Mutex::new(None));
+        let owned_slot = slot.clone();
+        let owned_cancel = cancel.clone();
+        let (ready, receive) = tokio::sync::oneshot::channel();
+        let (claimed, claim) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _permit = permit;
+            if owned_cancel.is_cancelled() {
+                let _ = ready.send(Err(russh::Error::Disconnect));
+                return;
+            }
+            // Do not timeout/drop this future: that would recreate the leak.
+            match handle.channel_open_session().await {
+                Ok(channel) => *owned_slot.lock().unwrap() = Some(channel),
+                Err(error) => {
+                    let _ = ready.send(Err(error));
+                    return;
+                }
+            }
+            let _ = ready.send(Ok(()));
+            tokio::select! {
+                biased;
+                _ = owned_cancel.cancelled() => {},
+                _ = claim => {}, // Receiver claimed it, or was dropped.
+            }
+            // Sending the channel itself over oneshot would leak if that
+            // receiver were dropped *after* send succeeded. This shared slot
+            // retains ownership until the receiver synchronously claims it.
+            let unclaimed = owned_slot.lock().unwrap().take();
+            if let Some(channel) = unclaimed {
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), channel.close()).await;
+            }
+        });
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(russh::Error::Disconnect),
+            result = receive => {
+                result.map_err(|_| russh::Error::Disconnect)??;
+                let channel = slot.lock().unwrap().take().ok_or(russh::Error::Disconnect)?;
+                let _ = claimed.send(());
+                Ok(channel)
+            }
+        }
+    }
+
     pub fn stream(&self, mut channel: russh::Channel<russh::client::Msg>) -> DuplexStream {
         let (stream, mut relay) = tokio::io::duplex(64 * 1024);
         let cancel = self.cancel.clone();
@@ -199,3 +260,7 @@ mod tests {
         std::fs::remove_file(path).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "channel_scope_tests.rs"]
+mod initialisation_tests;

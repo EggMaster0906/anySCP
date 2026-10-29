@@ -236,8 +236,7 @@ pub async fn bounded_copy<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     Ok(received)
 }
 
-type SshHandle =
-    Arc<tokio::sync::Mutex<russh::client::Handle<crate::ssh::handler::SshClientHandler>>>;
+type SshHandle = crate::ssh::handle::SharedHandle;
 
 /// Snapshot session handles at acceptance, including the actual SCP transport
 /// and bucket. No manager map guard survives a network await.
@@ -368,7 +367,7 @@ pub async fn download(
             path,
             ..
         } => {
-            let meta = crate::scp::exec::stat(handle.clone(), *flavor, path)
+            let meta = crate::scp::exec::stat_scoped(handle.clone(), *flavor, path, Some(scope))
                 .await
                 .map_err(PreviewError::remote)?
                 .ok_or_else(|| {

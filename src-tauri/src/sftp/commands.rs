@@ -128,9 +128,7 @@ pub async fn sftp_open(
 /// Open an independent subsystem on the existing SSH transport. Preview tasks
 /// use their own channel so cancellation never tears down Explorer's session.
 pub(crate) async fn open_sftp_session(
-    handle_arc: Arc<
-        tokio::sync::Mutex<russh::client::Handle<crate::ssh::handler::SshClientHandler>>,
-    >,
+    handle_arc: crate::ssh::handle::SharedHandle,
     use_sudo: bool,
 ) -> Result<russh_sftp::client::SftpSession, SftpError> {
     let channel = open_sftp_channel(handle_arc, use_sudo, None).await?;
@@ -150,20 +148,16 @@ pub(crate) async fn open_sftp_session(
 
 /// Return the initialized protocol channel separately for scoped preview I/O.
 pub(crate) async fn open_sftp_channel(
-    handle_arc: Arc<
-        tokio::sync::Mutex<russh::client::Handle<crate::ssh::handler::SshClientHandler>>,
-    >,
+    handle_arc: crate::ssh::handle::SharedHandle,
     use_sudo: bool,
     scope: Option<&crate::ssh::channel_scope::ChannelScope>,
 ) -> Result<russh::Channel<russh::client::Msg>, SftpError> {
-    // 2. Lock only long enough to open the channel, then release immediately.
-    let channel = {
-        let handle = handle_arc.lock().await;
-        handle
-            .channel_open_session()
-            .await
-            .map_err(|e| SftpError::ChannelError(e.to_string()))?
-    };
+    let channel = if let Some(scope) = scope {
+        scope.open(handle_arc.clone()).await
+    } else {
+        handle_arc.channel_open_session().await
+    }
+    .map_err(|e| SftpError::ChannelError(e.to_string()))?;
 
     let channel = crate::ssh::channel_scope::ChannelGuard::new(channel, scope);
 
@@ -175,13 +169,12 @@ pub(crate) async fn open_sftp_channel(
         // the timeout — russh-sftp does not cancel the pending init when the
         // channel hits EOF — so we'd hang ~30 s instead of failing cleanly.
         // `sudo -n true` exits non-zero immediately when a password is required.
-        let check = {
-            let handle = handle_arc.lock().await;
-            handle
-                .channel_open_session()
-                .await
-                .map_err(|e| SftpError::ChannelError(e.to_string()))?
-        };
+        let check = if let Some(scope) = scope {
+            scope.open(handle_arc.clone()).await
+        } else {
+            handle_arc.channel_open_session().await
+        }
+        .map_err(|e| SftpError::ChannelError(e.to_string()))?;
         let mut check = crate::ssh::channel_scope::ChannelGuard::new(check, scope);
         check
             .exec(true, "sudo -n true")

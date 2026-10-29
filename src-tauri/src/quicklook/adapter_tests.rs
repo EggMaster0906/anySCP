@@ -5,12 +5,11 @@ use super::{
     MAX_BYTES,
 };
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 const PDF_FIXTURE: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 53 >>\nstream\nBT /F1 16 Tf 30 100 Td (anySCP Quick Look PDF) Tj ET\nendstream\nendobj\n5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000241 00000 n \n0000000343 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n413\n%%EOF\n";
 
-type Handle = Arc<Mutex<russh::client::Handle<crate::ssh::handler::SshClientHandler>>>;
+type Handle = crate::ssh::handle::SharedHandle;
 
 async fn connect(port: u16) -> Handle {
     let config = Arc::new(russh::client::Config::default());
@@ -25,7 +24,7 @@ async fn connect(port: u16) -> Handle {
         .authenticate_password("testuser", "testpass")
         .await
         .unwrap());
-    Arc::new(Mutex::new(handle))
+    Arc::new(crate::ssh::handle::ConnectionHandle::new(handle))
 }
 
 #[tokio::test]
@@ -368,7 +367,7 @@ async fn quicklook_s3_if_match_is_enforced_without_mutating_shared_bucket() {
 async fn quicklook_cancels_real_stalled_sftp_and_scp_readers() {
     let handle = connect(24222).await;
     for sftp in [true, false] {
-        let channel = handle.lock().await.channel_open_session().await.unwrap();
+        let channel = handle.channel_open_session().await.unwrap();
         channel.exec(true, "sleep 30").await.unwrap();
         let cancel = CancellationToken::new();
         let scope = crate::ssh::channel_scope::ChannelScope::new(&cancel);
