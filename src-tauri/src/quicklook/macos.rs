@@ -6,12 +6,14 @@ use std::path::Path;
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSWindow,
-    NSWindowDelegate,
+    NSWindowDelegate, NSWindowDidResignMainNotification,
 };
-use objc2_foundation::{MainThreadMarker, NSNotification, NSObjectProtocol, NSString, NSURL};
+use objc2_foundation::{
+    MainThreadMarker, NSNotification, NSNotificationCenter, NSObjectProtocol, NSString, NSURL,
+};
 use objc2_quick_look_ui::{
     QLPreviewItem, QLPreviewPanel, QLPreviewPanelDataSource, QLPreviewPanelDelegate,
 };
@@ -20,6 +22,7 @@ type OnClose = Box<dyn Fn()>;
 
 struct ControllerIvars {
     url: Retained<NSURL>,
+    window: Retained<NSWindow>,
     active: Cell<bool>,
     controlled: Cell<bool>,
     on_close: RefCell<Option<OnClose>>,
@@ -37,9 +40,21 @@ define_class!(
     unsafe impl NSObjectProtocol for PreviewController {}
 
     impl PreviewController {
+        #[unsafe(method(ownerWindowResignedMain:))]
+        fn owner_resigned(&self, _notification: &NSNotification) {
+            // QLPreviewPanel can cache its controller when another Tauri window
+            // becomes main. Observe only this owner; keep Tauri's delegate.
+            if self.ivars().active.get() && self.ivars().controlled.get() {
+                if let Some(panel) = unsafe { QLPreviewPanel::sharedPreviewPanel(self.mtm()) } {
+                    panel.orderOut(None);
+                }
+                self.notify_closed();
+            }
+        }
+
         #[unsafe(method(acceptsPreviewPanelControl:))]
         fn accepts(&self, _panel: Option<&QLPreviewPanel>) -> bool {
-            self.ivars().active.get()
+            self.ivars().active.get() && self.ivars().window.isMainWindow()
         }
 
         #[unsafe(method(beginPreviewPanelControl:))]
@@ -59,6 +74,7 @@ define_class!(
                 panel.setDataSource(None);
                 panel.setDelegate(None);
             }
+            if self.ivars().active.get() && panel.isVisible() { panel.orderOut(None); }
             self.notify_closed();
         }
     }
@@ -152,6 +168,7 @@ pub fn show(
     ));
     let controller = PreviewController::alloc(mtm).set_ivars(ControllerIvars {
         url,
+        window: window.clone(),
         active: Cell::new(true),
         controlled: Cell::new(false),
         on_close: RefCell::new(Some(on_close)),
@@ -165,6 +182,7 @@ pub fn show(
         window.setNextResponder(Some(&controller));
     }
     window.makeKeyAndOrderFront(None);
+    window.makeMainWindow();
     panel.makeKeyAndOrderFront(None);
     unsafe {
         panel.updateController();
@@ -209,6 +227,14 @@ pub fn show(
         panel.orderOut(None);
         return Err("Could not monitor preview keyboard events".into());
     };
+    unsafe {
+        NSNotificationCenter::defaultCenter().addObserver_selector_name_object(
+            &controller,
+            sel!(ownerWindowResignedMain:),
+            Some(NSWindowDidResignMainNotification),
+            Some(&window),
+        );
+    }
     SESSION.with(|s| {
         *s.borrow_mut() = Some(NativeSession {
             id,
@@ -241,6 +267,7 @@ pub fn close(id: Option<&str>) {
         s.controller.ivars().active.set(false);
         s.controller.ivars().on_close.borrow_mut().take();
         unsafe {
+            NSNotificationCenter::defaultCenter().removeObserver(&s.controller);
             NSEvent::removeMonitor(&s.monitor);
             if s.controller.ivars().controlled.replace(false) {
                 s.panel.setDataSource(None);

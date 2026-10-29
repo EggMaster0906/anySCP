@@ -8,12 +8,14 @@ use tokio_util::sync::CancellationToken;
 pub struct ChannelScope {
     cancel: CancellationToken,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    pending: Mutex<Vec<russh::Channel<russh::client::Msg>>>,
 }
 impl ChannelScope {
     pub fn new(parent: &CancellationToken) -> Self {
         Self {
             cancel: parent.child_token(),
             tasks: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
         }
     }
 
@@ -58,14 +60,17 @@ impl ChannelScope {
     }
 
     fn close_channel(&self, channel: russh::Channel<russh::client::Msg>) {
-        let task = tokio::spawn(async move {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), channel.close()).await;
-        });
-        self.tasks.lock().unwrap().push(task);
+        // Guard::drop may run during runtime teardown: queue the channel here,
+        // and perform async work only in finish(), never spawn from Drop.
+        self.pending.lock().unwrap().push(channel);
     }
 
     pub async fn finish(&self) {
         self.cancel.cancel();
+        let pending = std::mem::take(&mut *self.pending.lock().unwrap());
+        for channel in pending {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), channel.close()).await;
+        }
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
         for task in tasks {
             let _ = task.await;

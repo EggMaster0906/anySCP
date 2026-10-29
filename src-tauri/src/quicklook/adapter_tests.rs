@@ -100,7 +100,7 @@ async fn quicklook_real_ssh_adapters() {
             ("link.png", "invalid_selection"),
             ("folder", "invalid_selection"),
             ("missing.txt", "download_failed"),
-            ("denied.txt", "download_failed"),
+            ("denied.txt", "permission_denied"),
             ("large.txt", "too_large"),
         ] {
             let file = staging.request(name).unwrap();
@@ -181,5 +181,120 @@ async fn quicklook_real_s3_adapter() {
     .await
     .is_err());
     scope.finish().await;
+    bucket.delete().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires loopback SSH/SCP fixtures from tests/quicklook/compose.yml"]
+async fn quicklook_repeated_real_cancellation_releases_channels() {
+    for (port, sftp) in [(24222, true), (24223, false), (24224, false)] {
+        let handle = connect(port).await;
+        let flavor = crate::scp::exec::detect_flavor(handle.clone())
+            .await
+            .unwrap();
+        let remote = format!("/tmp/preview-cancel-{}", uuid::Uuid::new_v4());
+        let command = format!("truncate -s 20971520 {}", crate::scp::shell_quote(&remote));
+        assert_eq!(
+            crate::scp::exec::ssh_exec(handle.clone(), &command)
+                .await
+                .unwrap()
+                .2,
+            0
+        );
+        let parent = tempfile::tempdir().unwrap();
+        let staging = StagingRoot::new(parent.path()).unwrap();
+        let source = if sftp {
+            Source::Sftp {
+                handle: handle.clone(),
+                sudo: false,
+                path: remote.clone(),
+                ssh_id: "fixture".into(),
+            }
+        } else {
+            Source::Scp {
+                handle: handle.clone(),
+                flavor,
+                path: remote.clone(),
+                ssh_id: "fixture".into(),
+            }
+        };
+        for _ in 0..12 {
+            let token = CancellationToken::new();
+            let scope = crate::ssh::channel_scope::ChannelScope::new(&token);
+            let file = staging.request("cancel.txt").unwrap();
+            let result = super::with_deadline(
+                &token,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                staging::download(&source, &file, &token, &scope, |bytes, _| {
+                    if bytes > 0 {
+                        token.cancel();
+                    }
+                }),
+            )
+            .await;
+            scope.finish().await;
+            assert_eq!(result.unwrap_err().kind, "cancelled");
+            assert!(!file.complete.exists());
+        }
+        // Leaked channels would exceed OpenSSH's MaxSessions before this point.
+        let token = CancellationToken::new();
+        let scope = crate::ssh::channel_scope::ChannelScope::new(&token);
+        let file = staging.request("complete.txt").unwrap();
+        super::with_deadline(
+            &token,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(20),
+            staging::download(&source, &file, &token, &scope, |_, _| {}),
+        )
+        .await
+        .unwrap();
+        scope.finish().await;
+        assert_eq!(
+            std::fs::metadata(&file.complete).unwrap().len(),
+            20 * 1024 * 1024
+        );
+        let command = format!("rm -f {}", crate::scp::shell_quote(&remote));
+        assert_eq!(
+            crate::scp::exec::ssh_exec(handle, &command)
+                .await
+                .unwrap()
+                .2,
+            0
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires local MinIO fixture from tests/quicklook/compose.yml"]
+async fn quicklook_s3_if_match_is_enforced_without_mutating_shared_bucket() {
+    use s3::{bucket_ops::BucketConfiguration, creds::Credentials, Bucket, Region};
+    let credentials =
+        Credentials::new(Some("minioadmin"), Some("minioadmin"), None, None, None).unwrap();
+    let region = Region::Custom {
+        region: "us-east-1".into(),
+        endpoint: "http://127.0.0.1:24900".into(),
+    };
+    let name = format!("quicklook-{}", uuid::Uuid::new_v4());
+    let bucket =
+        Bucket::create_with_path_style(&name, region, credentials, BucketConfiguration::default())
+            .await
+            .unwrap()
+            .bucket;
+    bucket.put_object("object", b"old version").await.unwrap();
+    let (head, _) = bucket.head_object("object").await.unwrap();
+    bucket.put_object("object", b"new version").await.unwrap();
+    let mut pinned = bucket.clone();
+    pinned
+        .extra_headers_mut()
+        .insert("if-match", head.e_tag.unwrap().parse().unwrap());
+    assert_ne!(
+        pinned
+            .get_object_stream("object")
+            .await
+            .map(|response| response.status_code)
+            .ok(),
+        Some(200)
+    );
+    assert!(bucket.extra_headers().get("if-match").is_none());
+    bucket.delete_object("object").await.unwrap();
     bucket.delete().await.unwrap();
 }

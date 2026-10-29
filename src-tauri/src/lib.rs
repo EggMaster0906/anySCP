@@ -392,7 +392,9 @@ pub fn run() {
                     api.prevent_exit();
                     let app = app.clone();
                     tauri::async_runtime::spawn(async move {
-                        manager.wait_for_cleanup().await;
+                        if tokio::time::timeout(std::time::Duration::from_secs(5), manager.wait_for_cleanup()).await.is_err() {
+                            tracing::warn!("Quick Look shutdown cleanup timed out; stale staging will be retried at startup");
+                        }
                         app.exit(0);
                     });
                 }

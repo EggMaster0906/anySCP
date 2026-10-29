@@ -72,9 +72,11 @@ impl StagingRoot {
         let sweep = private_file(&root.join("sweep.lock"), false)?;
         sweep.lock_exclusive().map_err(PreviewError::io)?;
         for entry in std::fs::read_dir(&root).map_err(PreviewError::io)? {
-            let entry = entry.map_err(PreviewError::io)?;
+            let Ok(entry) = entry else {
+                continue;
+            };
             if uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).is_err()
-                || !entry.file_type().map_err(PreviewError::io)?.is_dir()
+                || !entry.file_type().is_ok_and(|kind| kind.is_dir())
             {
                 continue;
             }
@@ -84,7 +86,10 @@ impl StagingRoot {
                     continue;
                 }
             }
-            let owner = private_file(&lock_path, false)?;
+            let owner = match private_file(&lock_path, false) {
+                Ok(owner) => owner,
+                Err(_) => continue, // Another live process may just have removed its own run.
+            };
             if owner.try_lock_exclusive().is_ok() {
                 // Retain the owner lock until removal completes.
                 if let Err(e) = std::fs::remove_dir_all(entry.path()) {
@@ -115,8 +120,13 @@ impl StagingRoot {
             .map_err(|_| PreviewError::new("invalid_selection", "Unsafe preview filename"))?;
         let directory = self.path.join(uuid::Uuid::new_v4().to_string());
         private_dir(&directory)?;
+        let part_name = if name == "download.part" {
+            "download.part.part"
+        } else {
+            "download.part"
+        };
         Ok(StagedFile {
-            part: directory.join("download.part"),
+            part: directory.join(part_name),
             complete: directory.join(name),
             directory,
         })
@@ -149,8 +159,28 @@ impl StagedFile {
 
 impl Drop for StagedFile {
     fn drop(&mut self) {
-        if let Err(e) = std::fs::remove_dir_all(&self.directory) {
-            tracing::warn!(error = %e, "Could not remove Quick Look request; will retry at next startup");
+        if let Err(error) = std::fs::remove_dir_all(&self.directory) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return;
+            }
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let directory = self.directory.clone();
+                runtime.spawn(async move {
+                    for delay in [100, 500, 1500] {
+                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                        match tokio::fs::remove_dir_all(&directory).await {
+                            Ok(()) => return,
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                            Err(_) => {}
+                        }
+                    }
+                    tracing::warn!(
+                        "Quick Look request cleanup deferred to next startup after retries"
+                    );
+                });
+            } else {
+                tracing::warn!(error = %error, "Quick Look request cleanup deferred to next startup");
+            }
         }
     }
 }
@@ -327,9 +357,9 @@ pub async fn download(
             }
             let mut writer = file.writer()?;
             bounded_copy(&mut remote, &mut writer, meta.size, &mut progress).await?;
-            remote.shutdown().await.map_err(PreviewError::remote)?;
+            let _ = remote.shutdown().await;
             drop(writer);
-            sftp.close().await.map_err(PreviewError::remote)?;
+            let _ = sftp.close().await;
         }
         Source::Scp {
             handle,
@@ -414,13 +444,26 @@ async fn download_s3(
         None => None,
     };
     let mut pinned = bucket.clone();
-    if let Some(etag) = &head.e_tag {
-        pinned.extra_headers_mut().insert(
-            "if-match",
-            etag.parse()
-                .map_err(|_| PreviewError::new("download_failed", "Invalid S3 ETag"))?,
-        );
-    }
+    let etag = head
+        .e_tag
+        .as_deref()
+        .filter(|etag| !etag.is_empty() && !etag.starts_with("W/"))
+        .ok_or_else(|| {
+            PreviewError::new(
+                "download_failed",
+                "This S3 service provides no strong ETag for a consistent preview",
+            )
+        })?;
+    let etag = if etag.starts_with('"') {
+        etag.to_string()
+    } else {
+        format!("\"{etag}\"")
+    };
+    pinned.extra_headers_mut().insert(
+        "if-match",
+        etag.parse()
+            .map_err(|_| PreviewError::new("download_failed", "Invalid S3 ETag"))?,
+    );
     // One streaming GET avoids assembling ranges from different versions.
     // If-Match binds it to HEAD where supported. A second HEAD below also
     // detects services ignoring that condition while an object is changing.
@@ -431,8 +474,13 @@ async fn download_s3(
         )
     })?;
     if response.status_code != 200 {
+        let kind = match response.status_code {
+            412 => "object_changed",
+            401 | 403 => "permission_denied",
+            _ => "download_failed",
+        };
         return Err(PreviewError::new(
-            "download_failed",
+            kind,
             "S3 object changed or download was denied",
         ));
     }
@@ -578,5 +626,112 @@ mod tests {
         assert!(second.path.exists());
         assert!(!dead.exists());
         assert!(unrelated.exists());
+    }
+}
+
+#[cfg(test)]
+mod s3_consistency_tests {
+    use super::*;
+
+    async fn fixture(
+        responses: Vec<String>,
+    ) -> (Box<s3::Bucket>, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 16 * 1024);
+                }
+                requests.push(String::from_utf8(request).unwrap());
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+            requests
+        });
+        let bucket = s3::Bucket::new(
+            "fixture",
+            s3::Region::Custom {
+                region: "test".into(),
+                endpoint: format!("http://{address}"),
+            },
+            s3::creds::Credentials::anonymous().unwrap(),
+        )
+        .unwrap()
+        .with_path_style();
+        (bucket, server)
+    }
+    fn head(etag: Option<&str>, size: Option<u64>) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n{}{}\r\n",
+            etag.map(|etag| format!("ETag: {etag}\r\n"))
+                .unwrap_or_default(),
+            size.map(|size| format!("Content-Length: {size}\r\n"))
+                .unwrap_or_default()
+        )
+    }
+    fn body() -> String {
+        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello".into()
+    }
+
+    #[tokio::test]
+    async fn no_validator_or_oversized_metadata_never_starts_a_get() {
+        for (response, kind) in [
+            (head(None, Some(5)), "download_failed"),
+            (head(Some("W/\"weak\""), Some(5)), "download_failed"),
+            (head(Some("\"A\""), Some(MAX_BYTES + 1)), "too_large"),
+        ] {
+            let (bucket, server) = fixture(vec![response]).await;
+            let parent = tempfile::tempdir().unwrap();
+            let root = StagingRoot::new(parent.path()).unwrap();
+            let file = root.request("test.txt").unwrap();
+            assert_eq!(
+                download_s3(&bucket, "key", &file, &mut |_, _| {})
+                    .await
+                    .unwrap_err()
+                    .kind,
+                kind
+            );
+            assert!(!file.complete.exists());
+            assert_eq!(server.await.unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn unknown_size_is_bounded_and_sends_a_quoted_condition() {
+        let (bucket, server) =
+            fixture(vec![head(Some("A"), None), body(), head(Some("A"), None)]).await;
+        let parent = tempfile::tempdir().unwrap();
+        let root = StagingRoot::new(parent.path()).unwrap();
+        let file = root.request("test.txt").unwrap();
+        download_s3(&bucket, "key", &file, &mut |_, _| {})
+            .await
+            .unwrap();
+        let requests = server.await.unwrap();
+        assert!(requests[1].to_lowercase().contains("if-match: \"a\"\r\n"));
+        assert!(!requests[1].to_lowercase().contains("range:"));
+        assert!(bucket.extra_headers().get("if-match").is_none());
+    }
+
+    #[tokio::test]
+    async fn changed_object_or_denied_get_cannot_publish_partial_staging() {
+        for (responses, kind) in [
+            (vec![head(Some("\"A\""), Some(5)), body(), head(Some("\"B\""), Some(5))], "download_failed"),
+            (vec![head(Some("\"A\""), Some(5)), "HTTP/1.1 412 Precondition Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()], "object_changed"),
+            (vec![head(Some("\"A\""), Some(5)), "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()], "permission_denied"),
+        ] {
+            let (bucket, server) = fixture(responses).await;
+            let parent = tempfile::tempdir().unwrap(); let root = StagingRoot::new(parent.path()).unwrap();
+            let file = root.request("test.txt").unwrap();
+            assert_eq!(download_s3(&bucket, "key", &file, &mut |_, _| {}).await.unwrap_err().kind, kind);
+            assert!(!file.complete.exists());
+            server.await.unwrap();
+        }
     }
 }

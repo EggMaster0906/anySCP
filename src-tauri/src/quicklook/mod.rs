@@ -38,7 +38,16 @@ impl PreviewError {
         Self::new("local_io", e)
     }
     pub fn remote(e: impl ToString) -> Self {
-        Self::new("download_failed", e)
+        let message = e.to_string();
+        let lower = message.to_lowercase();
+        let kind = if lower.contains("permission denied") {
+            "permission_denied"
+        } else if lower.contains("connection") || lower.contains("session closed") {
+            "session_unavailable"
+        } else {
+            "download_failed"
+        };
+        Self::new(kind, message)
     }
     pub fn session(e: impl ToString) -> Self {
         Self::new("session_unavailable", e)
@@ -178,6 +187,10 @@ impl Request {
     fn progress(&self, app: &tauri::AppHandle, bytes: u64, total: Option<u64>) {
         let mut last = self.last_progress.lock().unwrap();
         if last.elapsed() < Duration::from_millis(100) && bytes != 0 && Some(bytes) != total {
+            let mut state = self.snapshot.lock().unwrap();
+            state.phase = "downloading".into();
+            state.bytes_received = bytes;
+            state.total_bytes = total;
             return;
         }
         *last = Instant::now();
@@ -302,6 +315,12 @@ impl QuickLookManager {
         });
         let writer = {
             let mut windows = self.windows.lock().unwrap();
+            if self.shutting_down.load(Ordering::SeqCst) {
+                return Err(PreviewError::new(
+                    "session_unavailable",
+                    "Application is closing",
+                ));
+            }
             let state = windows.entry(window).or_default();
             if !state.open(request.clone()) {
                 return Ok(false);
@@ -349,10 +368,11 @@ impl QuickLookManager {
     }
 
     pub fn close_window(&self, window: &str) {
-        if let Some(state) = self.windows.lock().unwrap().get_mut(window) {
-            if let Some(request) = state.current.take() {
-                request.cancel.cancel();
-            }
+        let mut windows = self.windows.lock().unwrap();
+        let state = windows.entry(window.into()).or_default();
+        state.revision = u64::MAX; // Permanent tombstone for a destroyed window.
+        if let Some(request) = state.current.take() {
+            request.cancel.cancel();
         }
     }
 
@@ -385,10 +405,11 @@ impl QuickLookManager {
     }
 
     pub fn begin_shutdown(&self) -> bool {
+        let windows = self.windows.lock().unwrap();
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return false;
         }
-        for state in self.windows.lock().unwrap().values() {
+        for state in windows.values() {
             if let Some(request) = &state.current {
                 request.cancel.cancel();
             }
@@ -677,5 +698,30 @@ mod deadline_tests {
         })
         .await;
         assert_eq!(result.unwrap_err().kind, "cancelled");
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    #[test]
+    fn window_destruction_keeps_a_tombstone_even_before_any_open_arrives() {
+        let parent = tempfile::tempdir().unwrap();
+        let manager = QuickLookManager::new(parent.path()).unwrap();
+        manager.close_window("late-ipc");
+        let windows = manager.windows.lock().unwrap();
+        let state = windows.get("late-ipc").unwrap();
+        assert_eq!(state.revision, u64::MAX);
+        assert!(state.current.is_none());
+        // The retained gate is also used by shutdown cleanup.
+        assert!(state.writer.try_lock().is_ok());
+    }
+    #[test]
+    fn shutdown_is_idempotent_and_marks_the_registry_before_it_can_be_reused() {
+        let parent = tempfile::tempdir().unwrap();
+        let manager = QuickLookManager::new(parent.path()).unwrap();
+        assert!(manager.begin_shutdown());
+        assert!(manager.shutting_down.load(Ordering::SeqCst));
+        assert!(!manager.begin_shutdown());
     }
 }

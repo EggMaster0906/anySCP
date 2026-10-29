@@ -18,11 +18,21 @@ fn main() {
 
     let fixture = tempfile::tempdir().unwrap();
     let path = fixture.path().join("Quick Look 測試.txt");
-    std::fs::write(&path, "anySCP native Quick Look responder probe\n").unwrap();
+    let path = if let Some(source) = std::env::args_os().nth(1) {
+        let source = std::path::PathBuf::from(source);
+        let target = fixture.path().join(source.file_name().unwrap());
+        std::fs::copy(source, &target).unwrap();
+        target
+    } else {
+        std::fs::write(&path, "anySCP native Quick Look responder probe\n").unwrap();
+        path
+    };
     let closed = Arc::new(AtomicUsize::new(0));
     tauri::Builder::default().setup(move |app| {
         let window = WebviewWindowBuilder::new(app, "probe", WebviewUrl::App("index.html".into()))
             .title("anySCP Quick Look native probe").build()?;
+        let other = WebviewWindowBuilder::new(app, "other", WebviewUrl::App("index.html".into()))
+            .title("Quick Look control handoff probe").visible(false).build()?;
         let handle = app.handle().clone();
         let closed = closed.clone();
         std::thread::spawn(move || {
@@ -42,6 +52,7 @@ fn main() {
                 }).unwrap();
                 rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
                 std::thread::sleep(Duration::from_millis(400));
+                let other = other.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 handle.run_on_main_thread(move || {
                     let mtm = MainThreadMarker::new().unwrap();
@@ -49,15 +60,22 @@ fn main() {
                     assert!(panel.isVisible(), "panel not visible in cycle {cycle}");
                     assert!(unsafe { panel.currentController() }.is_some());
                     assert!(unsafe { panel.currentPreviewItem() }.is_some());
-                    if cycle % 3 == 2 {
+                    if cycle % 4 == 3 {
+                            let pointer = other.ns_window().unwrap();
+                            let other = unsafe { &*pointer.cast::<objc2_app_kit::NSWindow>() };
+                            other.makeKeyAndOrderFront(None);
+                            other.makeMainWindow();
+                            unsafe { panel.updateController(); }
+
+                        } else if cycle % 4 == 2 {
                         panel.performClose(None);
                     } else {
-                        let key = if cycle % 3 == 0 { " " } else { "\u{1b}" };
+                        let key = if cycle % 4 == 0 { " " } else { "\u{1b}" };
                         let text = NSString::from_str(key);
                         let event = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
                             NSEventType::KeyDown, NSPoint::ZERO, NSEventModifierFlags::empty(), 0.0,
                             panel.windowNumber(), None, &text, &text, false,
-                            if cycle % 3 == 0 { 49 } else { 53 },
+                            if cycle % 4 == 0 { 49 } else { 53 },
                         ).unwrap();
                         NSApplication::sharedApplication(mtm).postEvent_atStart(&event, false);
                     }
@@ -68,13 +86,15 @@ fn main() {
                 assert_eq!(closed.load(Ordering::SeqCst), cycle + 1, "close callback missing");
                 let (tx, rx) = std::sync::mpsc::channel();
                 handle.run_on_main_thread(move || {
+                    let panel = unsafe { QLPreviewPanel::sharedPreviewPanel(MainThreadMarker::new().unwrap()).unwrap() };
+                    assert!(!panel.isVisible(), "closed/control-loss panel must be hidden");
                     macos::close(Some(&cycle.to_string()));
                     tx.send(()).unwrap();
                 }).unwrap();
                 rx.recv_timeout(Duration::from_secs(10)).unwrap();
                 eprintln!("Quick Look native cycle {}/20 passed", cycle + 1);
             }
-            eprintln!("PASS: 20 native show/control/Space/Esc/close/cleanup cycles");
+            eprintln!("PASS: 20 native show/control/Space/Esc/close/control-loss/cleanup cycles");
             handle.exit(0);
         });
         Ok(())
