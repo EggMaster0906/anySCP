@@ -3,7 +3,7 @@
 - 建立日期：2026-10-30
 - 分支：`feature/explorer-quicklook`
 - 原始碼評估基準：`6f9f92f`
-- 狀態：規劃完成，功能尚未實作、編譯或執行驗證。
+- 狀態：P1～P4 已實作並分階段提交；P5 已執行開發機原生、自動化及 Linux 回歸驗證，Windows／最低 macOS／Intel 與完整人工驗收仍待完成。詳見 [驗證紀錄](QuickLook-MVP-VALIDATION.md)。
 - 目標：依本計畫循序完成可交付的 macOS Quick Look MVP；概念驗證只是第一個里程碑。
 
 ## 1. MVP 的使用者體驗與範圍
@@ -102,6 +102,7 @@ type QuickLookTarget =
 - 原生 window 從 Tauri command context 取得；前端不能指定別的 window 或任意本機路徑。
 - `ownerId` 識別 Explorer 實例，`requestId` 識別單次開啟；同一個 window 的控制器共用遞增 `revision`，open／close 都攜帶它。
 - manager 對每個 window 序列化狀態變更，拒絕過期 revision。close 先抵達時也更新 revision，讓稍後才抵達的舊 open 無法重新啟動。
+- Quick Look shared panel 是程序共用單例；原生層保留目前 request 身分，新視窗取得面板前通知舊 owner，舊 owner 的延遲關閉不能影響新面板。
 - 同一個 window 同時最多一個有效預覽。新 open 使舊任務失效、取消並關閉舊面板；新下載等舊 writer 釋放後才開始，避免暫存與下載量無界增加。
 - 舊 owner 的延遲清理不能關掉新 owner 的面板；關閉需檢查 owner／request 身分，不以「關閉所有預覽」實作前端 cleanup。
 - 新增 `quicklook:state` 事件：`requestId`、`ownerId`、`revision`、`phase`、`bytesReceived`、可選 `totalBytes`／`error`；只發送到所屬 window。
@@ -122,7 +123,7 @@ idle → preparing → downloading → visible → closed → idle
 1. 後端驗證 session，解析檔案身分與類型；不信任列表傳來的 size、entryType 或檔名。
 2. SFTP 檢查 symlink／一般檔案；SCP 檢查 metadata 並驗證 wire file header 的大小；S3 取得 object metadata，確認請求 bucket 與目前 session 一致後固定 bucket handle。
 3. 預先知道超過 100 MiB 時不下載。傳輸中仍強制計算實收 bytes，超額立即中止；不可只靠預檢，亦不可因未知大小而取消上限。
-4. SCP 如需擴充 helper，讓既有呼叫端可維持原行為，預覽額外傳入限制。S3 分段下載若可取得 ETag／版本，使用條件請求防止不同版本拼接；不相容服務無法維持一致性時回報失敗，不顯示不完整檔案。
+4. SCP 如需擴充 helper，讓既有呼叫端可維持原行為，預覽額外傳入限制。S3 使用單次串流 GET 避免分段版本混用，要求 strong ETag 並送出 If-Match；下載後再檢查 metadata。缺少 validator 或物件改變時回報失敗，不顯示不完整檔案。
 5. 以固定大小 buffer 串流到私有目錄中的 `.part`；保持 UI 與 metadata 查詢可用，不在完整傳輸期間持有 session manager 全域鎖。
 6. cancel／timeout 必須能中斷等待中的網路 I/O，而不只檢查區塊之間的旗標。終止預覽專用 channel／task，不拆掉其他 terminal 或一般傳輸的共享 SSH 連線。
 7. 檔案完整接收、flush 並關閉 writer 後，才 rename 為保留原副檔名的最終名稱，交給 Quick Look。失敗或取消絕不預覽 `.part`。
@@ -219,14 +220,14 @@ cargo test
 
 - [ ] P1～P5 全部完成，三種遠端來源都能從 Explorer 單檔預覽。
 - [ ] 空白鍵、Esc、原生關閉與焦點回復符合第 1、4 節。
-- [ ] 下載中的提示、大小上限、deadline 與實際 I/O 取消均已驗證。
+- [x] 下載中的提示、大小上限、deadline 與實際 I/O 取消均已驗證（自動化／真實 adapter；牆鐘與完整人工流程的範圍見驗證紀錄）。
 - [ ] A／B 競態、過期 open／close、tab／bucket／session 失效都有自動測試及相關手動結果。
-- [ ] staging 隔離與清理完成；預覽不走 editor watcher，不回傳遠端。
+- [x] staging 隔離與清理完成；預覽不走 editor watcher，不回傳遠端。
 - [ ] 非 macOS 的 UI 退化、Linux 回歸與 Windows 編譯結果已記錄。
 - [ ] macOS debug bundle 成功建置，真實原生面板驗收完成；不能只以 mocked IPC 宣告成功。
-- [ ] README 說明操作、首次下載、100 MiB／60 秒限制、系統格式支援與 macOS 限定。
-- [ ] 在 `PLAN/QuickLook-MVP-VALIDATION.md` 記錄實測 commit、環境、指令結果、驗收矩陣及未驗證限制；只在實際執行後建立結果，不預填通過。
-- [ ] 無臨時 fixture IPC、測試資料或憑證進入正式介面／提交。
+- [x] README 說明操作、首次下載、100 MiB／60 秒限制、系統格式支援與 macOS 限定。
+- [x] 在 `PLAN/QuickLook-MVP-VALIDATION.md` 記錄實測 commit、環境、指令結果、驗收矩陣及未驗證限制；只在實際執行後建立結果，不預填通過。
+- [x] 無臨時 fixture IPC 或真實遠端資料／憑證進入正式介面／提交；合成資料僅限測試碼。
 
 ## 8. 官方參考與待確認事項
 
