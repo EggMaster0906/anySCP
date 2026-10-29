@@ -188,10 +188,15 @@ pub fn show(
         panel.updateController();
     }
     if !controller.ivars().controlled.get() {
+        controller.ivars().active.set(false);
         unsafe {
             window.setNextResponder(previous.as_deref());
+            controller.setNextResponder(None);
         }
         panel.orderOut(None);
+        unsafe {
+            panel.updateController();
+        }
         return Err("Quick Look did not grant responder control".into());
     }
 
@@ -223,8 +228,12 @@ pub fn show(
             panel.setDataSource(None);
             panel.setDelegate(None);
             window.setNextResponder(previous.as_deref());
+            controller.setNextResponder(None);
         }
         panel.orderOut(None);
+        unsafe {
+            panel.updateController();
+        }
         return Err("Could not monitor preview keyboard events".into());
     };
     unsafe {

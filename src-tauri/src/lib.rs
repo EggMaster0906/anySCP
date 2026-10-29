@@ -386,6 +386,12 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if matches!(&event, tauri::RunEvent::Exit) {
+                // Also detach on the bounded-shutdown fallback before TLS
+                // releases the panel's unretained delegate/data source.
+                quicklook::macos::close(None);
+            }
             if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 let manager = app.state::<Arc<quicklook::QuickLookManager>>().inner().clone();
                 if manager.begin_shutdown() {
