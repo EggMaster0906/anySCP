@@ -25,7 +25,7 @@ use sftp::transfer_manager::TransferManager;
 use sftp::SftpManager;
 use ssh::manager::SshManager;
 use std::sync::Arc;
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Listener, Manager, WebviewUrl, WebviewWindowBuilder};
 
 /// Whether this is a real release build — i.e. a packaged binary that can
 /// safely self-update via the updater plugin.
@@ -199,6 +199,15 @@ pub fn run() {
             app.manage(Arc::new(quicklook::QuickLookManager::new(
                 &app.path().app_cache_dir()?,
             )?));
+
+            let quicklook_app = app.handle().clone();
+            app.listen("ssh:status", move |event| {
+                if let Ok(status) = serde_json::from_str::<types::events::SshStatusPayload>(event.payload()) {
+                    if matches!(status.status, types::session::ConnectionStatus::Disconnecting | types::session::ConnectionStatus::Disconnected | types::session::ConnectionStatus::Error(_)) {
+                        quicklook_app.state::<Arc<quicklook::QuickLookManager>>().close_ssh_session(&status.session_id);
+                    }
+                }
+            });
 
             telemetry::init();
 

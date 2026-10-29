@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod adapter_tests;
 pub mod commands;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -141,6 +143,7 @@ struct IdentityEvent {
 struct Request {
     identity: Identity,
     target: Target,
+    ssh_id: Option<String>,
     window: String,
     cancel: CancellationToken,
     native_closed: AtomicBool,
@@ -269,6 +272,7 @@ impl QuickLookManager {
                 "Invalid preview request identity",
             ));
         }
+        let source = staging::Source::bind(&app, &target)?;
         let snapshot = StateEvent {
             identity: IdentityEvent {
                 request_id: identity.request_id.clone(),
@@ -282,6 +286,7 @@ impl QuickLookManager {
         };
         let request = Arc::new(Request {
             identity,
+            ssh_id: source.ssh_id().map(str::to_string),
             target,
             window: window.clone(),
             cancel: CancellationToken::new(),
@@ -301,7 +306,7 @@ impl QuickLookManager {
         request.emit(&app, "preparing", 0, None, None);
         let manager = self.clone();
         tauri::async_runtime::spawn(async move {
-            manager.run(app, request, writer, deadline).await;
+            manager.run(app, request, source, writer, deadline).await;
         });
         Ok(true)
     }
@@ -357,6 +362,20 @@ impl QuickLookManager {
         }
     }
 
+    pub fn close_ssh_session(&self, id: &str) {
+        for state in self.windows.lock().unwrap().values_mut() {
+            if state
+                .current
+                .as_ref()
+                .is_some_and(|r| r.ssh_id.as_deref() == Some(id))
+            {
+                if let Some(request) = state.current.take() {
+                    request.cancel.cancel();
+                }
+            }
+        }
+    }
+
     pub fn begin_shutdown(&self) -> bool {
         if self.shutting_down.swap(true, Ordering::SeqCst) {
             return false;
@@ -387,6 +406,7 @@ impl QuickLookManager {
         self: Arc<Self>,
         app: tauri::AppHandle,
         request: Arc<Request>,
+        source: staging::Source,
         writer: Arc<AsyncMutex<()>>,
         deadline: tokio::time::Instant,
     ) {
@@ -408,6 +428,7 @@ impl QuickLookManager {
                     return;
                 }
             };
+        let scope = crate::ssh::channel_scope::ChannelScope::new(&request.cancel);
         let mut staged = None;
         let preparing = async {
             if !self.current(&request) {
@@ -416,7 +437,7 @@ impl QuickLookManager {
             let file = self.staging.request(request.target.name()?)?;
             staged = Some(file);
             let file = staged.as_ref().unwrap();
-            staging::download(&app, &request.target, file, |bytes, total| {
+            staging::download(&source, file, &request.cancel, &scope, |bytes, total| {
                 request.progress(&app, bytes, total)
             })
             .await?;
@@ -427,6 +448,7 @@ impl QuickLookManager {
                 .await
         };
         let result = with_deadline(&request.cancel, deadline, preparing).await;
+        scope.finish().await;
         let phase = match &result {
             Ok(()) if self.current(&request) => {
                 let state = request.snapshot.lock().unwrap().clone();
@@ -554,6 +576,7 @@ mod tests {
         Arc::new(Request {
             identity: identity(owner, id, revision),
             window: "test".into(),
+            ssh_id: None,
             target: Target::Sftp {
                 session_id: "session".into(),
                 path: "/file.txt".into(),

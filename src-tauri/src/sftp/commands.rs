@@ -133,6 +133,29 @@ pub(crate) async fn open_sftp_session(
     >,
     use_sudo: bool,
 ) -> Result<russh_sftp::client::SftpSession, SftpError> {
+    let channel = open_sftp_channel(handle_arc, use_sudo, None).await?;
+
+    // 4. Hand the channel's byte-stream to the russh-sftp client (10 s default
+    //    init timeout). Do NOT raise this: russh's request_subsystem above
+    //    returns *before* the server's accept/reject reply, so on a host
+    //    without the SFTP subsystem (e.g. SCP-only) this init is what fails —
+    //    a longer timeout just delays the frontend's SFTP→SCP fallback by that
+    //    much (a 30 s value broke the SCP-fallback e2e specs).
+    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
+        .await
+        .map_err(|e| SftpError::ProtocolError(e.to_string()))?;
+
+    Ok(sftp)
+}
+
+/// Return the initialized protocol channel separately for scoped preview I/O.
+pub(crate) async fn open_sftp_channel(
+    handle_arc: Arc<
+        tokio::sync::Mutex<russh::client::Handle<crate::ssh::handler::SshClientHandler>>,
+    >,
+    use_sudo: bool,
+    scope: Option<&crate::ssh::channel_scope::ChannelScope>,
+) -> Result<russh::Channel<russh::client::Msg>, SftpError> {
     // 2. Lock only long enough to open the channel, then release immediately.
     let channel = {
         let handle = handle_arc.lock().await;
@@ -142,6 +165,8 @@ pub(crate) async fn open_sftp_session(
             .map_err(|e| SftpError::ChannelError(e.to_string()))?
     };
 
+    let channel = crate::ssh::channel_scope::ChannelGuard::new(channel, scope);
+
     // 3. Request the SFTP subsystem, or (sudo) preflight + exec sudo sftp-server.
     if use_sudo {
         // Preflight on a throwaway channel: confirm the user actually has
@@ -150,13 +175,14 @@ pub(crate) async fn open_sftp_session(
         // the timeout — russh-sftp does not cancel the pending init when the
         // channel hits EOF — so we'd hang ~30 s instead of failing cleanly.
         // `sudo -n true` exits non-zero immediately when a password is required.
-        let mut check = {
+        let check = {
             let handle = handle_arc.lock().await;
             handle
                 .channel_open_session()
                 .await
                 .map_err(|e| SftpError::ChannelError(e.to_string()))?
         };
+        let mut check = crate::ssh::channel_scope::ChannelGuard::new(check, scope);
         check
             .exec(true, "sudo -n true")
             .await
@@ -203,17 +229,7 @@ pub(crate) async fn open_sftp_session(
             .map_err(|e| SftpError::ChannelError(e.to_string()))?;
     }
 
-    // 4. Hand the channel's byte-stream to the russh-sftp client (10 s default
-    //    init timeout). Do NOT raise this: russh's request_subsystem above
-    //    returns *before* the server's accept/reject reply, so on a host
-    //    without the SFTP subsystem (e.g. SCP-only) this init is what fails —
-    //    a longer timeout just delays the frontend's SFTP→SCP fallback by that
-    //    much (a 30 s value broke the SCP-fallback e2e specs).
-    let sftp = russh_sftp::client::SftpSession::new(channel.into_stream())
-        .await
-        .map_err(|e| SftpError::ProtocolError(e.to_string()))?;
-
-    Ok(sftp)
+    Ok(channel.into_channel())
 }
 
 /// Close and remove an SFTP session.

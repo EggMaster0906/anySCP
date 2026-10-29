@@ -470,12 +470,14 @@ pub async fn s3_list_buckets(
 }
 
 #[tauri::command]
-#[instrument(skip(s3_manager))]
+#[instrument(skip(s3_manager, quicklook))]
 pub async fn s3_switch_bucket(
     s3_session_id: String,
     bucket_name: String,
     s3_manager: State<'_, Arc<S3Manager>>,
+    quicklook: State<'_, Arc<crate::quicklook::QuickLookManager>>,
 ) -> Result<(), S3Error> {
+    quicklook.close_session(&s3_session_id);
     s3_manager.switch_bucket(&s3_session_id, &bucket_name).await
 }
 

@@ -31,6 +31,8 @@ pub enum ScpError {
     RemoteIoError(String),
     #[error("Local I/O error: {0}")]
     LocalIoError(String),
+    #[error("SCP file size {size} exceeds limit {limit}")]
+    SizeLimitExceeded { size: u64, limit: u64 },
     #[error("Transfer cancelled")]
     TransferCancelled,
     #[allow(dead_code)]
@@ -61,6 +63,7 @@ impl Serialize for ScpError {
             ScpError::CommandFailed { .. } => "command_failed",
             ScpError::RemoteIoError(_) => "remote_io_error",
             ScpError::LocalIoError(_) => "local_io_error",
+            ScpError::SizeLimitExceeded { .. } => "size_limit_exceeded",
             ScpError::TransferCancelled => "transfer_cancelled",
             ScpError::PermissionDenied(_) => "permission_denied",
             ScpError::NotFound(_) => "not_found",
