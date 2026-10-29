@@ -140,6 +140,12 @@ struct IdentityEvent {
     revision: u64,
 }
 
+#[derive(Serialize)]
+pub struct Snapshot {
+    revision: u64,
+    current: Option<StateEvent>,
+}
+
 struct Request {
     identity: Identity,
     target: Target,
@@ -331,13 +337,15 @@ impl QuickLookManager {
                 .is_some_and(|r| r.identity.matches(&request.identity))
     }
 
-    pub fn snapshot(&self, window: &str) -> Option<StateEvent> {
-        self.windows
-            .lock()
-            .unwrap()
-            .get(window)
-            .and_then(|s| s.current.as_ref())
-            .map(|r| r.snapshot.lock().unwrap().clone())
+    pub fn snapshot(&self, window: &str) -> Snapshot {
+        let windows = self.windows.lock().unwrap();
+        let state = windows.get(window);
+        Snapshot {
+            revision: state.map_or(0, |s| s.revision),
+            current: state
+                .and_then(|s| s.current.as_ref())
+                .map(|r| r.snapshot.lock().unwrap().clone()),
+        }
     }
 
     pub fn close_window(&self, window: &str) {

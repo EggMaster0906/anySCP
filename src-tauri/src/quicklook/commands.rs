@@ -1,4 +1,4 @@
-use super::{Identity, PreviewError, QuickLookManager, StateEvent, Target, MAX_BYTES};
+use super::{Identity, PreviewError, QuickLookManager, Snapshot, Target, MAX_BYTES};
 use serde::Serialize;
 use std::sync::Arc;
 use tauri::{Manager, State, WebviewWindow};
@@ -46,6 +46,6 @@ pub fn quicklook_close(
 pub fn quicklook_state(
     window: WebviewWindow,
     manager: State<'_, Arc<QuickLookManager>>,
-) -> Option<StateEvent> {
+) -> Snapshot {
     manager.snapshot(window.label())
 }
