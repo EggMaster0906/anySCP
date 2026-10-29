@@ -9,6 +9,7 @@ pub struct ChannelScope {
     cancel: CancellationToken,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     pending: Mutex<Vec<russh::Channel<russh::client::Msg>>>,
+    writers: Mutex<Vec<tokio::fs::File>>,
 }
 impl ChannelScope {
     pub fn new(parent: &CancellationToken) -> Self {
@@ -16,6 +17,7 @@ impl ChannelScope {
             cancel: parent.child_token(),
             tasks: Mutex::new(Vec::new()),
             pending: Mutex::new(Vec::new()),
+            writers: Mutex::new(Vec::new()),
         }
     }
 
@@ -71,6 +73,13 @@ impl ChannelScope {
         for channel in pending {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(2), channel.close()).await;
         }
+        // Tokio file writes can still be running in the blocking pool after
+        // their owning future is dropped. Flush them before staging is deleted
+        // or a replacement request is allowed to acquire the writer gate.
+        let writers = std::mem::take(&mut *self.writers.lock().unwrap());
+        for mut writer in writers {
+            let _ = writer.flush().await;
+        }
         let tasks = std::mem::take(&mut *self.tasks.lock().unwrap());
         for task in tasks {
             let _ = task.await;
@@ -119,5 +128,74 @@ impl Drop for ChannelGuard<'_> {
         if let (Some(scope), Some(channel)) = (self.scope, self.channel.take()) {
             scope.close_channel(channel);
         }
+    }
+}
+
+/// Cancellation-safe ownership of local writes belonging to the channel scope.
+/// The unscoped case preserves the existing normal-download behavior.
+pub struct ScopedFile<'a> {
+    file: Option<tokio::fs::File>,
+    scope: Option<&'a ChannelScope>,
+}
+impl<'a> ScopedFile<'a> {
+    pub fn new(file: tokio::fs::File, scope: Option<&'a ChannelScope>) -> Self {
+        Self {
+            file: Some(file),
+            scope,
+        }
+    }
+    pub async fn finish(mut self) -> std::io::Result<()> {
+        self.file.as_mut().unwrap().flush().await?;
+        self.file.take();
+        Ok(())
+    }
+}
+impl tokio::io::AsyncWrite for ScopedFile<'_> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buffer: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(self.get_mut().file.as_mut().unwrap()).poll_write(cx, buffer)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(self.get_mut().file.as_mut().unwrap()).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(self.get_mut().file.as_mut().unwrap()).poll_shutdown(cx)
+    }
+}
+impl Drop for ScopedFile<'_> {
+    fn drop(&mut self) {
+        if let (Some(file), Some(scope)) = (self.file.take(), self.scope) {
+            scope.writers.lock().unwrap().push(file);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancelled_writer_is_flushed_and_released_before_scope_cleanup_returns() {
+        let parent = tempfile::tempdir().unwrap();
+        let path = parent.path().join("download.part");
+        let cancel = CancellationToken::new();
+        let scope = ChannelScope::new(&cancel);
+        let file = tokio::fs::File::create(&path).await.unwrap();
+        let mut writer = ScopedFile::new(file, Some(&scope));
+        writer.write_all(&[42; 32 * 1024]).await.unwrap();
+        cancel.cancel();
+        drop(writer); // Pending filesystem work belongs to the scope now.
+        scope.finish().await;
+        assert_eq!(std::fs::read(&path).unwrap(), vec![42; 32 * 1024]);
+        assert!(scope.writers.lock().unwrap().is_empty());
+        std::fs::remove_file(path).unwrap();
     }
 }

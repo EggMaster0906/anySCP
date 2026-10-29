@@ -231,9 +231,12 @@ async fn download_file_inner<F: FnMut(u64)>(
     } else {
         options.create(true).truncate(true);
     }
-    let mut local_file = options.open(local_path).await.map_err(|e| {
+    let local_file = options.open(local_path).await.map_err(|e| {
         ScpError::LocalIoError(format!("cannot create {}: {e}", local_path.display()))
     })?;
+
+    let mut local_file =
+        crate::ssh::channel_scope::ScopedFile::new(local_file, limit.and_then(|limit| limit.scope));
 
     let stream_result = wire::stream_bytes(
         &mut stream,
@@ -248,7 +251,9 @@ async fn download_file_inner<F: FnMut(u64)>(
     if let Err(e) = stream_result {
         // Clean up the partial local file before surfacing the error.
         drop(local_file);
-        let _ = tokio::fs::remove_file(local_path).await;
+        if limit.is_none() {
+            let _ = tokio::fs::remove_file(local_path).await;
+        }
         return Err(e);
     }
 
@@ -272,6 +277,10 @@ async fn download_file_inner<F: FnMut(u64)>(
             ));
         }
     }
+    local_file
+        .finish()
+        .await
+        .map_err(|e| ScpError::LocalIoError(e.to_string()))?;
     let _ = stream.shutdown().await;
     Ok(())
 }

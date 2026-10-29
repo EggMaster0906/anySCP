@@ -355,10 +355,11 @@ pub async fn download(
             if meta.file_type() != russh_sftp::protocol::FileType::File {
                 return Err(PreviewError::invalid_file());
             }
-            let mut writer = file.writer()?;
+            let mut writer =
+                crate::ssh::channel_scope::ScopedFile::new(file.writer()?, Some(scope));
             bounded_copy(&mut remote, &mut writer, meta.size, &mut progress).await?;
             let _ = remote.shutdown().await;
-            drop(writer);
+            writer.finish().await.map_err(PreviewError::io)?;
             let _ = sftp.close().await;
         }
         Source::Scp {
@@ -402,7 +403,7 @@ pub async fn download(
             })?;
         }
         Source::S3 { bucket, key } => {
-            download_s3(bucket, key, file, &mut progress).await?;
+            download_s3(bucket, key, file, Some(scope), &mut progress).await?;
         }
     }
     file.finish().await
@@ -425,6 +426,7 @@ async fn download_s3(
     bucket: &s3::Bucket,
     key: &str,
     file: &StagedFile,
+    scope: Option<&crate::ssh::channel_scope::ChannelScope>,
     progress: &mut impl FnMut(u64, Option<u64>),
 ) -> Result<(), PreviewError> {
     use futures_util::StreamExt;
@@ -499,7 +501,7 @@ async fn download_s3(
             "S3 object changed or download was denied",
         ));
     }
-    let mut writer = file.writer()?;
+    let mut writer = crate::ssh::channel_scope::ScopedFile::new(file.writer()?, scope);
     let mut received = 0;
     progress(0, expected);
     while let Some(chunk) = response.bytes().next().await {
@@ -517,7 +519,7 @@ async fn download_s3(
         ));
     }
     writer.flush().await.map_err(PreviewError::io)?;
-    drop(writer);
+    writer.finish().await.map_err(PreviewError::io)?;
     let (after, code) = bucket
         .head_object(key)
         .await
@@ -750,7 +752,7 @@ mod s3_consistency_tests {
         let result = super::super::with_deadline(
             &cancel,
             tokio::time::Instant::now() + std::time::Duration::from_secs(5),
-            download_s3(&bucket, "key", &file, &mut progress),
+            download_s3(&bucket, "key", &file, None, &mut progress),
         )
         .await;
         assert_eq!(result.unwrap_err().kind, "cancelled");
@@ -770,7 +772,7 @@ mod s3_consistency_tests {
             let root = StagingRoot::new(parent.path()).unwrap();
             let file = root.request("test.txt").unwrap();
             assert_eq!(
-                download_s3(&bucket, "key", &file, &mut |_, _| {})
+                download_s3(&bucket, "key", &file, None, &mut |_, _| {})
                     .await
                     .unwrap_err()
                     .kind,
@@ -788,7 +790,7 @@ mod s3_consistency_tests {
         let parent = tempfile::tempdir().unwrap();
         let root = StagingRoot::new(parent.path()).unwrap();
         let file = root.request("test.txt").unwrap();
-        download_s3(&bucket, "key", &file, &mut |_, _| {})
+        download_s3(&bucket, "key", &file, None, &mut |_, _| {})
             .await
             .unwrap();
         let requests = server.await.unwrap();
@@ -807,7 +809,7 @@ mod s3_consistency_tests {
             let (bucket, server) = fixture(responses).await;
             let parent = tempfile::tempdir().unwrap(); let root = StagingRoot::new(parent.path()).unwrap();
             let file = root.request("test.txt").unwrap();
-            assert_eq!(download_s3(&bucket, "key", &file, &mut |_, _| {}).await.unwrap_err().kind, kind);
+            assert_eq!(download_s3(&bucket, "key", &file, None, &mut |_, _| {}).await.unwrap_err().kind, kind);
             assert!(!file.complete.exists());
             server.await.unwrap();
         }
