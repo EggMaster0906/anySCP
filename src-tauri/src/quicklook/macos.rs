@@ -8,7 +8,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSEvent, NSEventMask, NSEventModifierFlags, NSResponder, NSWindow, NSWindowDelegate,
+    NSEvent, NSEventMask, NSEventModifierFlags, NSEventType, NSResponder, NSWindow,
+    NSWindowDelegate,
 };
 use objc2_foundation::{MainThreadMarker, NSNotification, NSObjectProtocol, NSString, NSURL};
 use objc2_quick_look_ui::{
@@ -106,6 +107,9 @@ impl PreviewController {
 }
 
 fn is_close_key(event: &NSEvent) -> bool {
+    if event.r#type() != NSEventType::KeyDown {
+        return false;
+    }
     let modifiers = NSEventModifierFlags::Command
         | NSEventModifierFlags::Control
         | NSEventModifierFlags::Option
@@ -135,6 +139,10 @@ pub fn show(
     on_close: OnClose,
 ) -> Result<(), String> {
     let mtm = MainThreadMarker::new().ok_or("Quick Look requires the main thread")?;
+    let previous_owner = SESSION.with(|s| s.borrow().as_ref().map(|s| s.controller.clone()));
+    if let Some(owner) = previous_owner {
+        owner.notify_closed();
+    }
     close(None);
     let pointer = window.ns_window().map_err(|e| e.to_string())?;
     // Tauri owns a live NSWindow; retaining it keeps the chain anchor valid.
@@ -149,14 +157,14 @@ pub fn show(
         on_close: RefCell::new(Some(on_close)),
     });
     let controller: Retained<PreviewController> = unsafe { msg_send![super(controller), init] };
+    let panel =
+        unsafe { QLPreviewPanel::sharedPreviewPanel(mtm).ok_or("Quick Look panel unavailable")? };
     let previous = unsafe { window.nextResponder() };
     unsafe {
         controller.setNextResponder(previous.as_deref());
         window.setNextResponder(Some(&controller));
     }
     window.makeKeyAndOrderFront(None);
-    let panel =
-        unsafe { QLPreviewPanel::sharedPreviewPanel(mtm).ok_or("Quick Look panel unavailable")? };
     panel.makeKeyAndOrderFront(None);
     unsafe {
         panel.updateController();
@@ -165,6 +173,7 @@ pub fn show(
         unsafe {
             window.setNextResponder(previous.as_deref());
         }
+        panel.orderOut(None);
         return Err("Quick Look did not grant responder control".into());
     }
 
@@ -189,8 +198,17 @@ pub fn show(
     });
     let monitor = unsafe {
         NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler)
-    }
-    .ok_or("Could not monitor preview keyboard events")?;
+    };
+    let Some(monitor) = monitor else {
+        controller.ivars().active.set(false);
+        unsafe {
+            panel.setDataSource(None);
+            panel.setDelegate(None);
+            window.setNextResponder(previous.as_deref());
+        }
+        panel.orderOut(None);
+        return Err("Could not monitor preview keyboard events".into());
+    };
     SESSION.with(|s| {
         *s.borrow_mut() = Some(NativeSession {
             id,

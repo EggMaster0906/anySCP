@@ -196,9 +196,20 @@ pub fn run() {
             app.manage(s3_manager);
             app.manage(s3_transfer_manager);
 
+            app.manage(Arc::new(quicklook::QuickLookManager::new(
+                &app.path().app_cache_dir()?,
+            )?));
+
             telemetry::init();
 
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                if let Some(manager) = window.try_state::<Arc<quicklook::QuickLookManager>>() {
+                    manager.close_window(window.label());
+                }
+            }
         })
         .manage(SshManager::new())
         .invoke_handler(tauri::generate_handler![
@@ -356,11 +367,28 @@ pub fn run() {
             snippets::commands::list_snippet_folders,
             snippets::commands::delete_snippet_folder,
             snippets::commands::snippet_execute,
+            quicklook::commands::quicklook_capabilities,
+            quicklook::commands::quicklook_open,
+            quicklook::commands::quicklook_close,
+            quicklook::commands::quicklook_state,
             // Build info
             is_release_build,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+                let manager = app.state::<Arc<quicklook::QuickLookManager>>().inner().clone();
+                if manager.begin_shutdown() {
+                    api.prevent_exit();
+                    let app = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        manager.wait_for_cleanup().await;
+                        app.exit(0);
+                    });
+                }
+            }
+        });
 }
 
 #[cfg(test)]

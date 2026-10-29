@@ -106,6 +106,33 @@ pub async fn sftp_open(
         .get_handle(&session_id)
         .map_err(|e| SftpError::SshSessionNotFound(e.to_string()))?;
 
+    let sftp = open_sftp_session(handle_arc, use_sudo.unwrap_or(false)).await?;
+
+    // 5. Store and return a fresh ID.
+    let sftp_id = uuid::Uuid::new_v4().to_string();
+    sftp_manager.insert_session(
+        sftp_id.clone(),
+        SftpSessionWrapper {
+            sftp: Arc::new(tokio::sync::Mutex::new(sftp)),
+            ssh_session_id: session_id,
+            use_sudo: use_sudo.unwrap_or(false),
+        },
+    );
+
+    let sudo = use_sudo.unwrap_or(false);
+    tracing::info!(sftp_session_id = %sftp_id, sudo, "SFTP session opened");
+    crate::telemetry::capture("sftp_opened", serde_json::json!({ "sudo": sudo }));
+    Ok(sftp_id)
+}
+
+/// Open an independent subsystem on the existing SSH transport. Preview tasks
+/// use their own channel so cancellation never tears down Explorer's session.
+pub(crate) async fn open_sftp_session(
+    handle_arc: Arc<
+        tokio::sync::Mutex<russh::client::Handle<crate::ssh::handler::SshClientHandler>>,
+    >,
+    use_sudo: bool,
+) -> Result<russh_sftp::client::SftpSession, SftpError> {
     // 2. Lock only long enough to open the channel, then release immediately.
     let channel = {
         let handle = handle_arc.lock().await;
@@ -116,7 +143,7 @@ pub async fn sftp_open(
     };
 
     // 3. Request the SFTP subsystem, or (sudo) preflight + exec sudo sftp-server.
-    if use_sudo.unwrap_or(false) {
+    if use_sudo {
         // Preflight on a throwaway channel: confirm the user actually has
         // *passwordless* sudo before committing the SFTP channel. Without this,
         // a host that prompts for a password leaves the SFTP init blocked until
@@ -186,29 +213,18 @@ pub async fn sftp_open(
         .await
         .map_err(|e| SftpError::ProtocolError(e.to_string()))?;
 
-    // 5. Store and return a fresh ID.
-    let sftp_id = uuid::Uuid::new_v4().to_string();
-    sftp_manager.insert_session(
-        sftp_id.clone(),
-        SftpSessionWrapper {
-            sftp: Arc::new(tokio::sync::Mutex::new(sftp)),
-            ssh_session_id: session_id,
-        },
-    );
-
-    let sudo = use_sudo.unwrap_or(false);
-    tracing::info!(sftp_session_id = %sftp_id, sudo, "SFTP session opened");
-    crate::telemetry::capture("sftp_opened", serde_json::json!({ "sudo": sudo }));
-    Ok(sftp_id)
+    Ok(sftp)
 }
 
 /// Close and remove an SFTP session.
 #[tauri::command]
-#[instrument(skip(sftp_manager), fields(sftp_session_id = %sftp_session_id))]
+#[instrument(skip(sftp_manager, quicklook), fields(sftp_session_id = %sftp_session_id))]
 pub async fn sftp_close(
     sftp_session_id: String,
     sftp_manager: State<'_, Arc<SftpManager>>,
+    quicklook: State<'_, Arc<crate::quicklook::QuickLookManager>>,
 ) -> Result<(), SftpError> {
+    quicklook.close_session(&sftp_session_id);
     // Grab the Arc before removing from the map.
     let sftp_arc = {
         let session_ref = sftp_manager.get_session(&sftp_session_id)?;
