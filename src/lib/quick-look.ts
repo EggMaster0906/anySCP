@@ -40,7 +40,7 @@ export function isPreviewKey(event: {
   key: string; repeat: boolean; isComposing: boolean;
   metaKey: boolean; ctrlKey: boolean; altKey: boolean; shiftKey: boolean;
 }, target: Element): boolean {
-  return (event.key === " " || event.key === "Escape") && !event.repeat && !event.isComposing
+  return (event.key === " " || event.key === "Escape") && !event.isComposing
     && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey
     && !target.closest("input, textarea, select, [contenteditable]:not([contenteditable='false']), [role='textbox']");
 }

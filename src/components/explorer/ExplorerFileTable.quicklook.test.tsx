@@ -32,10 +32,18 @@ describe("Explorer Quick Look entry points", () => {
     expect(document.activeElement).toBe(row);
   });
 
-  it.each([{ repeat: true }, { isComposing: true }, { ctrlKey: true }, { metaKey: true }, { altKey: true }, { shiftKey: true }])("ignores repeat/composition/modifiers: %j", (extra) => {
+  it.each([{ isComposing: true }, { ctrlKey: true }, { metaKey: true }, { altKey: true }, { shiftKey: true }])("ignores composition/modifiers: %j", (extra) => {
     const view = table(); fireEvent.click(view.row());
     expect(fireEvent.keyDown(view.row(), { key: " ", ...extra })).toBe(true);
     expect(view.preview).not.toHaveBeenCalled();
+  });
+
+  it("suppresses scrolling while holding Space without retriggering preview", () => {
+    const view = table(); fireEvent.click(view.row());
+    expect(fireEvent.keyDown(view.row(), { key: " ", repeat: true })).toBe(false);
+    expect(view.preview).not.toHaveBeenCalled();
+    expect(fireEvent.keyDown(view.row(), { key: "Escape", repeat: true })).toBe(false);
+    expect(view.close).not.toHaveBeenCalled();
   });
 
   it("does not intercept Space on unsupported platforms", () => {

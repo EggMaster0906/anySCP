@@ -1125,9 +1125,11 @@ export function ExplorerFileTable({
         onKeyDown={(event) => {
           if (event.defaultPrevented || !onQuickLook || !isPreviewKey(event.nativeEvent, event.target as Element)) return;
           if (event.key === "Escape") {
-            if (quickLookActive) { event.preventDefault(); event.stopPropagation(); onQuickLookClose?.(); }
+            if (quickLookActive) { event.preventDefault(); event.stopPropagation(); if (!event.repeat) onQuickLookClose?.(); }
           } else if (selectedEntries.length === 1 && canQuickLook(selectedEntries[0])) {
-            event.preventDefault(); event.stopPropagation(); triggerQuickLook(selectedEntries[0]);
+            event.preventDefault(); event.stopPropagation();
+            // Holding Space must not repeatedly toggle or scroll the list.
+            if (!event.repeat) triggerQuickLook(selectedEntries[0]);
           }
         }}
         // -scroll, not -auto: the header above reserves the scrollbar gutter,
