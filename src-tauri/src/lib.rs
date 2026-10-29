@@ -386,7 +386,7 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { api, .. } = event {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
                 let manager = app.state::<Arc<quicklook::QuickLookManager>>().inner().clone();
                 if manager.begin_shutdown() {
                     api.prevent_exit();
@@ -395,7 +395,7 @@ pub fn run() {
                         if tokio::time::timeout(std::time::Duration::from_secs(5), manager.wait_for_cleanup()).await.is_err() {
                             tracing::warn!("Quick Look shutdown cleanup timed out; stale staging will be retried at startup");
                         }
-                        app.exit(0);
+                        app.exit(code.unwrap_or(0));
                     });
                 }
             }

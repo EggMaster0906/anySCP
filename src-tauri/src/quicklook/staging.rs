@@ -408,6 +408,19 @@ pub async fn download(
     file.finish().await
 }
 
+fn s3_error(error: s3::error::S3Error, message: &str) -> PreviewError {
+    let kind = match error {
+        s3::error::S3Error::HttpFailWithBody(401 | 403, _) => "permission_denied",
+        s3::error::S3Error::HttpFailWithBody(412, _) => "object_changed",
+        s3::error::S3Error::Reqwest(_)
+        | s3::error::S3Error::Io(_)
+        | s3::error::S3Error::Credentials(_) => "session_unavailable",
+        _ => "download_failed",
+    };
+    // Never expose response bodies, signed URLs, or credential errors.
+    PreviewError::new(kind, message)
+}
+
 async fn download_s3(
     bucket: &s3::Bucket,
     key: &str,
@@ -418,15 +431,19 @@ async fn download_s3(
     if key.ends_with('/') {
         return Err(PreviewError::invalid_file());
     }
-    let (head, code) = bucket.head_object(key).await.map_err(|_| {
-        PreviewError::new(
-            "download_failed",
+    let (head, code) = bucket.head_object(key).await.map_err(|error| {
+        s3_error(
+            error,
             "Could not read S3 object metadata (check connection and permissions)",
         )
     })?;
     if code != 200 || head.delete_marker == Some(true) {
         return Err(PreviewError::new(
-            "download_failed",
+            if matches!(code, 401 | 403) {
+                "permission_denied"
+            } else {
+                "download_failed"
+            },
             "S3 object is unavailable or access was denied",
         ));
     }
@@ -467,12 +484,10 @@ async fn download_s3(
     // One streaming GET avoids assembling ranges from different versions.
     // If-Match binds it to HEAD where supported. A second HEAD below also
     // detects services ignoring that condition while an object is changing.
-    let mut response = pinned.get_object_stream(key).await.map_err(|_| {
-        PreviewError::new(
-            "download_failed",
-            "S3 object download failed or the object changed",
-        )
-    })?;
+    let mut response = pinned
+        .get_object_stream(key)
+        .await
+        .map_err(|error| s3_error(error, "S3 object download failed or the object changed"))?;
     if response.status_code != 200 {
         let kind = match response.status_code {
             412 => "object_changed",
@@ -503,12 +518,10 @@ async fn download_s3(
     }
     writer.flush().await.map_err(PreviewError::io)?;
     drop(writer);
-    let (after, code) = bucket.head_object(key).await.map_err(|_| {
-        PreviewError::new(
-            "download_failed",
-            "Could not verify the downloaded S3 object",
-        )
-    })?;
+    let (after, code) = bucket
+        .head_object(key)
+        .await
+        .map_err(|error| s3_error(error, "Could not verify the downloaded S3 object"))?;
     if code != 200
         || head.e_tag != after.e_tag
         || head.version_id != after.version_id
@@ -678,6 +691,71 @@ mod s3_consistency_tests {
     }
     fn body() -> String {
         "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 5\r\n\r\nhello".into()
+    }
+
+    #[tokio::test]
+    async fn dropping_a_cancelled_s3_reader_closes_the_stalled_http_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for number in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                if number == 0 {
+                    socket
+                        .write_all(head(Some("\"A\""), Some(10)).as_bytes())
+                        .await
+                        .unwrap();
+                } else {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabc").await.unwrap();
+                    // The response body stalls here. Cancelling the downloader
+                    // must close this socket instead of waiting for EOF.
+                    assert_eq!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            socket.read(&mut byte)
+                        )
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                        0
+                    );
+                }
+            }
+        });
+        let bucket = s3::Bucket::new(
+            "fixture",
+            s3::Region::Custom {
+                region: "test".into(),
+                endpoint: format!("http://{address}"),
+            },
+            s3::creds::Credentials::anonymous().unwrap(),
+        )
+        .unwrap()
+        .with_path_style();
+        let parent = tempfile::tempdir().unwrap();
+        let root = StagingRoot::new(parent.path()).unwrap();
+        let file = root.request("stalled.txt").unwrap();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut progress = |bytes, _| {
+            if bytes > 0 {
+                cancel.cancel();
+            }
+        };
+        let result = super::super::with_deadline(
+            &cancel,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+            download_s3(&bucket, "key", &file, &mut progress),
+        )
+        .await;
+        assert_eq!(result.unwrap_err().kind, "cancelled");
+        assert!(!file.complete.exists());
+        server.await.unwrap();
     }
 
     #[tokio::test]

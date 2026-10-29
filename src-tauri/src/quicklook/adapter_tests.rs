@@ -8,6 +8,8 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+const PDF_FIXTURE: &[u8] = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 200] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>\nendobj\n4 0 obj\n<< /Length 53 >>\nstream\nBT /F1 16 Tf 30 100 Td (anySCP Quick Look PDF) Tj ET\nendstream\nendobj\n5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\nxref\n0 6\n0000000000 65535 f \n0000000009 00000 n \n0000000058 00000 n \n0000000115 00000 n \n0000000241 00000 n \n0000000343 00000 n \ntrailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n413\n%%EOF\n";
+
 type Handle = Arc<Mutex<russh::client::Handle<crate::ssh::handler::SshClientHandler>>>;
 
 async fn connect(port: u16) -> Handle {
@@ -71,7 +73,7 @@ async fn quicklook_real_ssh_adapters() {
                 "image.png",
                 include_bytes!("../../icons/32x32.png").as_slice(),
             ),
-            ("document.pdf", b"%PDF-1.4\nfixture\n%%EOF\n".as_slice()),
+            ("document.pdf", PDF_FIXTURE),
             ("empty.txt", b"".as_slice()),
         ] {
             let local = parent.path().join(name);
@@ -149,6 +151,7 @@ async fn quicklook_real_s3_adapter() {
             include_bytes!("../../icons/32x32.png").as_slice(),
         ),
         ("c/empty.txt", b"".as_slice()),
+        ("d/document.pdf", PDF_FIXTURE),
     ] {
         bucket.put_object(key, contents).await.unwrap();
         let file = staging.request(key.rsplit('/').next().unwrap()).unwrap();
@@ -180,6 +183,67 @@ async fn quicklook_real_s3_adapter() {
     )
     .await
     .is_err());
+    // A request retains its original bucket even after a session switches to
+    // a different bucket with the exact same object key.
+    let other_name = format!("quicklook-{}", uuid::Uuid::new_v4());
+    let other = Bucket::create_with_path_style(
+        &other_name,
+        bucket.region().clone(),
+        bucket.credentials().await.unwrap(),
+        BucketConfiguration::default(),
+    )
+    .await
+    .unwrap()
+    .bucket;
+    bucket
+        .put_object("same-name.txt", b"bucket A")
+        .await
+        .unwrap();
+    other
+        .put_object("same-name.txt", b"bucket B")
+        .await
+        .unwrap();
+    let manager = crate::s3::S3Manager::new();
+    manager
+        .connect(
+            "fixture".into(),
+            "test".into(),
+            &name,
+            "us-east-1",
+            Some("http://127.0.0.1:24900"),
+            "minioadmin",
+            "minioadmin",
+            true,
+        )
+        .unwrap();
+    let snapshot = manager.get_bucket("fixture").unwrap();
+    manager.switch_bucket("fixture", &other_name).await.unwrap();
+    for (pinned, expected) in [
+        (snapshot, b"bucket A".as_slice()),
+        (
+            manager.get_bucket("fixture").unwrap(),
+            b"bucket B".as_slice(),
+        ),
+    ] {
+        let file = staging.request("same-name.txt").unwrap();
+        staging::download(
+            &Source::S3 {
+                bucket: pinned,
+                key: "same-name.txt".into(),
+            },
+            &file,
+            &token,
+            &scope,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&file.complete).unwrap(), expected);
+    }
+    bucket.delete_object("same-name.txt").await.unwrap();
+    other.delete_object("same-name.txt").await.unwrap();
+    other.delete().await.unwrap();
+    manager.disconnect("fixture");
     scope.finish().await;
     bucket.delete().await.unwrap();
 }
@@ -297,4 +361,48 @@ async fn quicklook_s3_if_match_is_enforced_without_mutating_shared_bucket() {
     assert!(bucket.extra_headers().get("if-match").is_none());
     bucket.delete_object("object").await.unwrap();
     bucket.delete().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires loopback SSH fixture from tests/quicklook/compose.yml"]
+async fn quicklook_cancels_real_stalled_sftp_and_scp_readers() {
+    let handle = connect(24222).await;
+    for sftp in [true, false] {
+        let channel = handle.lock().await.channel_open_session().await.unwrap();
+        channel.exec(true, "sleep 30").await.unwrap();
+        let cancel = CancellationToken::new();
+        let scope = crate::ssh::channel_scope::ChannelScope::new(&cancel);
+        let mut stream = scope.stream(channel);
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+        let start = std::time::Instant::now();
+        let read = async {
+            if sftp {
+                let _ = russh_sftp::client::SftpSession::new(stream).await;
+            } else {
+                let _ = crate::scp::wire::read_msg(&mut stream).await;
+            }
+            Ok(())
+        };
+        assert_eq!(
+            super::with_deadline(
+                &cancel,
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5),
+                read
+            )
+            .await
+            .unwrap_err()
+            .kind,
+            "cancelled"
+        );
+        scope.finish().await;
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+    assert_eq!(
+        crate::scp::exec::ssh_exec(handle, "true").await.unwrap().2,
+        0
+    );
 }

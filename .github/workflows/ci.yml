@@ -95,6 +95,10 @@ jobs:
         working-directory: src-tauri
         run: cargo test
 
+      - name: Real Quick Look transport adapters (synthetic loopback fixtures)
+        run: tests/quicklook/run-adapters.sh
+
+
   native:
     name: Native compile (${{ matrix.os }})
     strategy:
@@ -130,9 +134,11 @@ jobs:
         if: runner.os == 'macOS'
         working-directory: src-tauri
         run: cargo test --locked
-      - name: Build linked macOS app
+      - name: Build linked macOS app without release signing
         if: runner.os == 'macOS'
-        run: pnpm tauri build --debug --bundles app
+        run: >-
+          pnpm tauri build --debug --bundles app
+          --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
   # Build the runner image ONCE per CI run and warm a cross-run GitHub Actions
   # layer cache. Without this, every e2e shard would rebuild the image from
