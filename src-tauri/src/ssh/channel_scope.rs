@@ -66,8 +66,10 @@ impl ChannelScope {
             // retains ownership until the receiver synchronously claims it.
             let unclaimed = owned_slot.lock().unwrap().take();
             if let Some(channel) = unclaimed {
-                let _ =
-                    tokio::time::timeout(std::time::Duration::from_secs(2), channel.close()).await;
+                // This task already owns no file and is bounded by the preview
+                // permit. Keep ownership through outgoing-queue backpressure,
+                // until Close is queued or the connection itself ends.
+                let _ = channel.close().await;
             }
         });
         tokio::select! {
@@ -111,12 +113,7 @@ impl ChannelScope {
             }
             // Closing this one channel does not lock/disconnect the shared SSH
             // handle or disturb the terminal/normal transfer channels.
-            if tokio::time::timeout(std::time::Duration::from_secs(2), channel.close())
-                .await
-                .is_err()
-            {
-                tracing::warn!("Quick Look SSH channel close could not be queued before timeout");
-            }
+            close_owned(channel).await;
         });
         self.tasks.lock().unwrap().push(task);
         stream
@@ -132,7 +129,7 @@ impl ChannelScope {
         self.cancel.cancel();
         let pending = std::mem::take(&mut *self.pending.lock().unwrap());
         for channel in pending {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), channel.close()).await;
+            close_owned(channel).await;
         }
         // Tokio file writes can still be running in the blocking pool after
         // their owning future is dropped. Flush them before staging is deleted
@@ -145,6 +142,20 @@ impl ChannelScope {
         for task in tasks {
             let _ = task.await;
         }
+    }
+}
+
+async fn close_owned(channel: russh::Channel<russh::client::Msg>) {
+    if tokio::time::timeout(std::time::Duration::from_secs(2), channel.close())
+        .await
+        .is_err()
+    {
+        // Let local-file cleanup finish promptly, but do not discard the SSH
+        // channel just because its outgoing mailbox is temporarily full. This
+        // continuation owns only the channel, never staging or the writer gate.
+        tokio::spawn(async move {
+            let _ = channel.close().await;
+        });
     }
 }
 impl Drop for ChannelScope {
