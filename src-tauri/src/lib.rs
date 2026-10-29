@@ -4,6 +4,7 @@ mod db;
 mod editors;
 mod import;
 mod portforward;
+mod quicklook;
 mod s3;
 mod scp;
 mod sftp;
