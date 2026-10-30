@@ -25,6 +25,7 @@ import {
   Info,
   Link2,
   AlertTriangle,
+  Eye,
 } from "lucide-react";
 import { ModalShell, BTN_GHOST, BTN_DANGER } from "../shared/ModalShell";
 import type {
@@ -42,6 +43,7 @@ import {
 } from "../../stores/settings-store";
 import { isEditableInEditor } from "../../lib/file-types";
 import { FilePropertiesDialog } from "./FilePropertiesDialog";
+import { canQuickLook, isPreviewKey } from "../../lib/quick-look";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -67,6 +69,10 @@ interface ExplorerFileTableProps {
   onRename?: (entry: ExplorerEntry, newName: string) => Promise<void>;
   onEditInEditor?: (entry: ExplorerEntry, editor?: EditorConfig) => void;
   onPresignUrl?: (entry: ExplorerEntry) => void;
+  onQuickLook?: (entry: ExplorerEntry, restoreFocus: () => void) => void;
+  onQuickLookClose?: () => void;
+  onQuickLookSelectionChange?: (entries: ExplorerEntry[]) => void;
+  quickLookActive?: boolean;
   /** Apply chmod permission bits. SFTP/SCP only; absent for S3 → the
    *  Properties dialog shows permissions read-only (or hides them). When
    *  `recursive` is true (directories only) returns a per-entry summary. */
@@ -352,6 +358,10 @@ export function ExplorerFileTable({
   onRename,
   onEditInEditor,
   onPresignUrl,
+  onQuickLook,
+  onQuickLookClose,
+  onQuickLookSelectionChange,
+  quickLookActive,
   onApplyPermissions,
   creatingFolder,
   onCreateFolder,
@@ -613,7 +623,15 @@ export function ExplorerFileTable({
     lastClickedId.current = entry.id;
   };
 
-  const selectedEntries = sortedEntries.filter((e) => selectedIds.has(e.id));
+  const selectedEntries = useMemo(() => sortedEntries.filter((e) => selectedIds.has(e.id)), [sortedEntries, selectedIds]);
+  useEffect(() => { onQuickLookSelectionChange?.(selectedEntries); }, [selectedEntries, onQuickLookSelectionChange]);
+
+  const triggerQuickLook = (entry: ExplorerEntry) => {
+    const focus = () => Array.from(tableRef.current?.querySelectorAll<HTMLElement>("[data-entry-id]") ?? [])
+      .find((row) => row.dataset.entryId === entry.id && row.dataset.entrySelected === "true")?.focus();
+    focus();
+    onQuickLook?.(entry, focus);
+  };
 
   // ─── Drag (pointer-based) ──────────────────────────────────────────────────
   //
@@ -903,6 +921,10 @@ export function ExplorerFileTable({
       return items;
     }
 
+    if (onQuickLook && canQuickLook(entry)) {
+      items.push({ label: "Quick Look", icon: Eye, onClick: () => triggerQuickLook(entry) });
+    }
+
     // Single item context menu. Only offered when at least one editor is
     // configured (auto-seeded on first run, or added in Settings → Editors).
     if (
@@ -1168,14 +1190,25 @@ export function ExplorerFileTable({
           if (event.target === tableRef.current) tableRef.current?.removeAttribute("tabindex");
         }}
         onKeyDown={(event) => {
-          if (event.target !== event.currentTarget || !sortedEntries.length) return;
-          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-          event.preventDefault();
-          const index = event.key === "ArrowDown" ? 0 : sortedEntries.length - 1;
-          const entry = sortedEntries[index];
-          setSelectedIds(new Set([entry.id]));
-          lastClickedId.current = entry.id;
-          tableRef.current?.querySelectorAll<HTMLElement>("[data-entry-row]")[index]?.focus();
+          if (event.defaultPrevented) return;
+          if (event.target === event.currentTarget && sortedEntries.length &&
+              (event.key === "ArrowDown" || event.key === "ArrowUp")) {
+            event.preventDefault();
+            const index = event.key === "ArrowDown" ? 0 : sortedEntries.length - 1;
+            const entry = sortedEntries[index];
+            setSelectedIds(new Set([entry.id]));
+            lastClickedId.current = entry.id;
+            tableRef.current?.querySelectorAll<HTMLElement>("[data-entry-row]")[index]?.focus();
+            return;
+          }
+          if (event.defaultPrevented || !onQuickLook || !isPreviewKey(event.nativeEvent, event.target as Element)) return;
+          if (event.key === "Escape") {
+            if (quickLookActive) { event.preventDefault(); event.stopPropagation(); if (!event.repeat) onQuickLookClose?.(); }
+          } else if (selectedEntries.length === 1 && canQuickLook(selectedEntries[0])) {
+            event.preventDefault(); event.stopPropagation();
+            // Holding Space must not repeatedly toggle or scroll the list.
+            if (!event.repeat) triggerQuickLook(selectedEntries[0]);
+          }
         }}
         // -scroll, not -auto: the header above reserves the scrollbar gutter,
         // so short listings would otherwise sit 6px left of their headers.
@@ -1267,6 +1300,7 @@ export function ExplorerFileTable({
                   data-entry-row="true"
                   data-entry-name={entry.name}
                   data-entry-id={entry.id}
+                  data-entry-selected={isSelected ? "true" : "false"}
                   data-entry-type={entry.entryType}
                   data-testid={`explorer-entry-${entry.name}`}
                   tabIndex={0}
