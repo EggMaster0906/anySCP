@@ -5,6 +5,8 @@
 - 起點：`74b95e4`；最後原始碼 commit：`81006c3`。本紀錄另立文件 commit。
 - 狀態：**P1～P4 實作完成，P5 已完成本機可執行的自動／原生驗證；完整人工驗收、Windows、最低 macOS 與 Intel 尚未完成。不能視為整份 Definition of Done 已全部通過。**
 
+後續 [Code Review 核對紀錄](QuickLook-CODE-REVIEW-2026-10-30.md) 已發現 6 項待處理問題（包含一項已用隔離 Rust 程式重現的取消競態）。本文件保留 `80b89d4` 交付時的驗證結果；不代表後續審查問題已修正。
+
 ## 分階段 commit
 
 | Commit | 產出 |
