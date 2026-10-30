@@ -1,6 +1,7 @@
 // Runs against the real Tauri/SQLite and remote listing surfaces.
 import { expect } from "chai";
 import { resetApp, relaunchApp } from "../helpers/reset.js";
+import { waitForPersistedSetting } from "../helpers/settings.js";
 import { waitForDashboard } from "../helpers/dashboard.js";
 import { openNewHostModal, fillPasswordHostForm, clickSave, waitForModalClosed, getHostId } from "../helpers/host.js";
 import { openNewS3Dialog, fillS3Form, clickS3Save, getS3Id } from "../helpers/s3.js";
@@ -69,12 +70,13 @@ describe("Explorer hidden-file visibility", () => {
         await openSettings();
         await (await $("[data-testid='s-hidden-files-hide']")).click();
         // Wait for the actual SQLite write, rather than racing an app restart.
-        await browser.waitUntil(async () => browser.execute(async () => {
-            const invoke = (window as unknown as { __TAURI_INTERNALS__: { invoke: (cmd: string) => Promise<[string, string][]> } }).__TAURI_INTERNALS__.invoke;
-            return (await invoke("load_all_settings")).some(([key, value]) => key === "explorer_show_hidden_files" && value === "false");
-        }), { timeout: 10_000 });
+        await waitForPersistedSetting("explorer_show_hidden_files", "false");
         await relaunchApp();
         await openSettings();
+        await browser.waitUntil(async () => (await (await $("[data-testid='s-hidden-files-hide']")).getAttribute("aria-checked")) === "true", {
+            timeout: 10_000,
+            timeoutMsg: "Hidden-files default did not reload as hide after restart",
+        });
         expect(await (await $("[data-testid='s-hidden-files-hide']")).getAttribute("aria-checked")).to.equal("true");
     });
 });
