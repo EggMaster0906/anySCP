@@ -134,3 +134,15 @@
 - `pnpm tauri build --debug --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'` 通過，更新 `src-tauri/target/debug/bundle/macos/anySCP.app`，供人工複測。
 - 暫存策略未新增跨次快取：`app_cache_dir()/quicklook-v1/<run UUID>/<preview UUID>/檔名`，面板解除引用、writer 結束後刪除該次 preview 目錄，失敗時重試／下次啟動清理；run 與 owner lock 保留至程式結束，root 與 sweep lock 可持續保留。重開同檔重新下載符合原 MVP 設計。
 - 此項獨立修正不代表上方連結的 Code Review 中 R1～R6 已處理。
+
+## 2026-10-30：關閉後重開時重用暫存
+
+- 依新需求新增本次程式執行期間、每個視窗獨立的 Quick Look 快取。以 transport／session／完整路徑／S3 bucket 區分目標；關閉面板後保留成功下載的檔案。
+- 每次預覽重新取得 SFTP lstat／SCP stat／S3 HEAD，不使用 Explorer 列表中的舊 metadata。遠端 mtime 小於或等於暫存記錄時間，且來源 metadata 與本機檔案檢查一致時，直接重用完成檔；較新、mtime 不明、暫存遺失／長度錯誤、大小或 S3 ETag／version 改變時重新下載。遠端查詢失敗、刪除或拒絕存取不回退至舊預覽。
+- 暫存記錄時間使用開始下載的本機時間，避免下載期間的更新因完成時間較晚而被視為已涵蓋。SCP portable `ls` fallback 的 mtime=0 視為未知，不永久重用。SSH 來源仍依賴伺服器正確更新 mtime，無法偵測大小、mtime 均保留的內容改寫。
+- 每視窗上限 32 檔／512 MiB，超過時清除最久未使用項目。session／bucket 失效、視窗銷毀與退出時清除相應快取；不跨 app 重啟保留。Arc 所有權確保淘汰／失效不會提前刪除原生面板仍引用的檔案。部分下載沿用原有 writer／channel cleanup 後才刪除的時序。
+- `cargo test --offline --manifest-path src-tauri/Cargo.toml`：236 通過、5 個 fixture 測試略過。新增 7 項快取測試，涵蓋時間比較、S3 HEAD-only 命中／更新／無效時間／暫存遺失／遠端拒絕及刪除、來源隔離、LRU／容量與面板持有期間不刪除。
+- `tests/quicklook/run-adapters.sh`：5 項實際協定測試通過；擴充其中的 SSH adapter 測試，對 SFTP、GNU SCP、BusyBox SCP 驗證未變更檔案重用同一完成檔，以及相同大小但 mtime 更新後取得新內容。使用固定 mtime，不依靠 sleep。測試容器／volume 已由腳本清除，原先停止的 Colima 已恢復停止。
+- `pnpm test`：34 files／201 tests 通過；Clippy all-targets、格式與 diff 檢查通過。尚未執行本次功能的 Explorer 到原生面板人工目視驗收，也未重新驗證其他平台。
+- `pnpm tauri build --debug --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'` 通過，包含 TypeScript／Vite build（既有 chunk warnings），已更新 `src-tauri/target/debug/bundle/macos/anySCP.app`。
+- 本次修改不代表上方 Code Review 的 R1～R6 已全部處理。

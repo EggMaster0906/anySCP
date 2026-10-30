@@ -408,7 +408,7 @@ pub async fn download(
     file.finish().await
 }
 
-fn s3_error(error: s3::error::S3Error, message: &str) -> PreviewError {
+pub(super) fn s3_error(error: s3::error::S3Error, message: &str) -> PreviewError {
     let kind = match error {
         s3::error::S3Error::HttpFailWithBody(401 | 403, _) => "permission_denied",
         s3::error::S3Error::HttpFailWithBody(412, _) => "object_changed",

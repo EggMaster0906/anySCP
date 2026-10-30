@@ -15,6 +15,12 @@ The script starts dedicated synthetic services on **127.0.0.1** ports 24222–24
 
 Coverage includes SFTP, GNU/busybox SCP, PNG/PDF/TXT/empty downloads, Unicode names, rejected symlinks/folders/missing/denied/oversized files, 12 successive cancellations followed by a successful transfer on the same SSH connection, cancellation of stalled SFTP/SCP readers, S3 bucket snapshots with identical object keys, and MinIO If-Match enforcement without shared-header mutation. Regular `cargo test` also runs real loopback SSH peers for late channel-open confirmations, stalled metadata and output limits, plus controlled HTTP fixtures for missing/weak ETags, object changes, denied GETs, and cancellation of a stalled S3 body.
 
+Quick Look retains completed downloads within the current app run, per window, keyed by transport, session, full remote path and (for S3) bucket. Every reopen reads fresh remote metadata. A regular local file with the expected size is reused when the remote mtime is no later than its recorded download-start time and its metadata still matches. Unknown mtimes (including SCP's portable `ls` fallback), missing/truncated local files, newer mtimes, changed sizes or S3 ETag/version changes cause a new download. Metadata errors never fall back to a stale preview. This relies on the remote server's timestamps; SSH cannot detect a same-size rewrite that preserves mtime.
+
+Each window keeps at most 32 entries / 512 MiB, evicting least recently used entries. Closing a preview preserves completed files; session/bucket invalidation, window destruction and app exit clear the relevant cache. Files still referenced by the native panel remain pinned until detach. Incomplete downloads retain the existing cancellation/cleanup behavior, and crashed-run cleanup still happens at startup. No cache is restored across app restarts.
+
+Cache regression coverage includes real SFTP/GNU SCP/BusyBox SCP reopens and same-size updates using fixed mtimes, plus controlled S3 HTTP tests verifying HEAD-only cache hits, updated objects, missing/invalid mtimes, missing local files and denied/deleted objects. Unit tests also cover timestamp equality/future values, target isolation, local symlink/truncation rejection, eviction and retaining panel ownership through cache removal.
+
 On a logged-in Mac, the native bridge has a separate probe:
 
 ```sh

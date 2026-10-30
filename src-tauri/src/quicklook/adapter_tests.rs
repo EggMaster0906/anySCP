@@ -87,6 +87,59 @@ async fn quicklook_real_ssh_adapters() {
                 .unwrap();
             assert_eq!(std::fs::read(&file.complete).unwrap(), contents);
         }
+        // Exercise cache reuse through each real protocol. Fixed mtimes avoid
+        // sleeps and catch implementations that trust a stale Explorer row.
+        let remote = format!("{remote_dir}/Unicode 測試.txt");
+        let quoted = crate::scp::shell_quote(&remote);
+        assert_eq!(
+            crate::scp::exec::ssh_exec(handle.clone(), &format!("touch -t 202001010000 {quoted}"))
+                .await
+                .unwrap()
+                .2,
+            0
+        );
+        let cache_source = source(remote.clone());
+        let prepare = |cached| {
+            let fresh = Arc::new(staging.request("Unicode 測試.txt").unwrap());
+            let source = &cache_source;
+            async move {
+                let token = CancellationToken::new();
+                let scope = crate::ssh::channel_scope::ChannelScope::new(&token);
+                let result = super::with_deadline(
+                    &token,
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                    super::cache::prepare(source, &fresh, cached, &token, &scope, |_, _| {}),
+                )
+                .await;
+                scope.finish().await;
+                result.unwrap()
+            }
+        };
+        let first = prepare(None).await;
+        let second = prepare(Some(first.clone())).await;
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged {port} file must reuse its completed download"
+        );
+        let local = parent.path().join("updated.txt");
+        std::fs::write(&local, b"updated text\n").unwrap();
+        crate::scp::transfer::upload_file(handle.clone(), &local, &remote, &token, |_| {})
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::scp::exec::ssh_exec(handle.clone(), &format!("touch -t 203701010000 {quoted}"))
+                .await
+                .unwrap()
+                .2,
+            0
+        );
+        let third = prepare(Some(second)).await;
+        assert_ne!(first.file.complete, third.file.complete);
+        assert_eq!(
+            std::fs::read(&third.file.complete).unwrap(),
+            b"updated text\n"
+        );
+
         let base = crate::scp::shell_quote(&remote_dir);
         let command = format!("ln -s {base}/image.png {base}/link.png; mkdir {base}/folder; touch {base}/denied.txt; chmod 000 {base}/denied.txt; truncate -s {} {base}/large.txt", MAX_BYTES + 1);
         // busybox's truncate is also supported by the fixture image.

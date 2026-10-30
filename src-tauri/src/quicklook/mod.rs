@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod adapter_tests;
+mod cache;
 pub mod commands;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -66,7 +67,7 @@ impl std::fmt::Display for PreviewError {
 }
 impl std::error::Error for PreviewError {}
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase")]
 pub enum Target {
     Sftp {
@@ -204,6 +205,7 @@ struct WindowState {
     current: Option<Arc<Request>>,
     // Held through native close and staging cleanup, including panel lifetime.
     writer: Arc<AsyncMutex<()>>,
+    cache: cache::PreviewCache,
 }
 impl WindowState {
     fn open(&mut self, request: Arc<Request>) -> bool {
@@ -374,10 +376,12 @@ impl QuickLookManager {
         if let Some(request) = state.current.take() {
             request.cancel.cancel();
         }
+        state.cache.clear();
     }
 
     pub fn close_session(&self, id: &str) {
         for state in self.windows.lock().unwrap().values_mut() {
+            state.cache.close_session(id);
             if state
                 .current
                 .as_ref()
@@ -392,6 +396,7 @@ impl QuickLookManager {
 
     pub fn close_ssh_session(&self, id: &str) {
         for state in self.windows.lock().unwrap().values_mut() {
+            state.cache.close_ssh_session(id);
             if state
                 .current
                 .as_ref()
@@ -428,6 +433,9 @@ impl QuickLookManager {
         for gate in gates {
             let _guard = gate.lock().await;
         }
+        for state in self.windows.lock().unwrap().values_mut() {
+            state.cache.clear();
+        }
         self.staging.cleanup();
     }
 
@@ -463,17 +471,42 @@ impl QuickLookManager {
             if !self.current(&request) {
                 return Err(PreviewError::new("cancelled", "Preview cancelled"));
             }
-            let file = self.staging.request(request.target.name()?)?;
-            staged = Some(file);
-            let file = staged.as_ref().unwrap();
-            staging::download(&source, file, &request.cancel, &scope, |bytes, total| {
-                request.progress(&app, bytes, total)
-            })
+            let cached = self
+                .windows
+                .lock()
+                .unwrap()
+                .get_mut(&request.window)
+                .and_then(|state| state.cache.take(&request.target));
+            staged = Some(Arc::new(self.staging.request(request.target.name()?)?));
+            let file = cache::prepare(
+                &source,
+                staged.as_ref().unwrap(),
+                cached,
+                &request.cancel,
+                &scope,
+                |bytes, total| request.progress(&app, bytes, total),
+            )
             .await?;
+            staged = Some(file.file.clone());
             if !self.current(&request) {
                 return Err(PreviewError::new("cancelled", "Preview cancelled"));
             }
-            self.show(&app, request.clone(), file.complete.clone())
+            // Share ownership with the panel. Eviction/session invalidation can
+            // remove the cache entry, but cannot delete a file still on screen.
+            {
+                let mut windows = self.windows.lock().unwrap();
+                if let Some(state) = windows.get_mut(&request.window) {
+                    if !request.cancel.is_cancelled()
+                        && state
+                            .current
+                            .as_ref()
+                            .is_some_and(|r| r.identity.matches(&request.identity))
+                    {
+                        state.cache.insert(request.target.clone(), file.clone());
+                    }
+                }
+            }
+            self.show(&app, request.clone(), file.file.complete.clone())
                 .await
         };
         let result = with_deadline(&request.cancel, deadline, preparing).await;
@@ -500,8 +533,8 @@ impl QuickLookManager {
             Err(_) => "error",
         };
         request.cancel.cancel();
-        // Await the main-thread detach, then remove the files, then release the
-        // writer gate. A stale main-thread show checks cancellation again.
+        // Detach before releasing panel ownership. Completed files remain in
+        // the bounded cache; failed/partial downloads are still removed.
         Self::hide(&app, request.identity.request_id.clone()).await;
         drop(staged);
         let error = result.err().filter(|e| e.kind != "cancelled");
