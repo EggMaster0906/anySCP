@@ -43,10 +43,18 @@ fn main() {
                 let w = window.clone();
                 let p = path.clone();
                 let counter = closed.clone();
+                let cleanup = handle.clone();
                 let (tx, rx) = std::sync::mpsc::channel();
                 handle.run_on_main_thread(move || {
                     let result = macos::show(&w, cycle.to_string(), &p, Box::new(move || {
                         counter.fetch_add(1, Ordering::SeqCst);
+                        // Match the manager: detach promptly from a background
+                        // task, while AppKit may still be finishing its close.
+                        // Deferring this until the assertion hid double-close bugs.
+                        let cleanup = cleanup.clone();
+                        std::thread::spawn(move || {
+                            cleanup.run_on_main_thread(move || macos::close(Some(&cycle.to_string()))).unwrap();
+                        });
                     }));
                     tx.send(result).unwrap();
                 }).unwrap();
@@ -78,6 +86,14 @@ fn main() {
                             if cycle % 4 == 0 { 49 } else { 53 },
                         ).unwrap();
                         NSApplication::sharedApplication(mtm).postEvent_atStart(&event, false);
+                        // A physical key press also releases the key; exercise
+                        // that event even when the panel is closing asynchronously.
+                        let release = NSEvent::keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode(
+                            NSEventType::KeyUp, NSPoint::ZERO, NSEventModifierFlags::empty(), 0.1,
+                            panel.windowNumber(), None, &text, &text, false,
+                            if cycle % 4 == 0 { 49 } else { 53 },
+                        ).unwrap();
+                        NSApplication::sharedApplication(mtm).postEvent_atStart(&release, false);
                     }
                     tx.send(()).unwrap();
                 }).unwrap();

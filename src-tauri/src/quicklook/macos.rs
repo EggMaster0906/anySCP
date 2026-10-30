@@ -25,6 +25,7 @@ struct ControllerIvars {
     window: Retained<NSWindow>,
     active: Cell<bool>,
     controlled: Cell<bool>,
+    closing: Cell<bool>,
     on_close: RefCell<Option<OnClose>>,
 }
 
@@ -46,7 +47,7 @@ define_class!(
             // becomes main. Observe only this owner; keep Tauri's delegate.
             if self.ivars().active.get() && self.ivars().controlled.get() {
                 if let Some(panel) = unsafe { QLPreviewPanel::sharedPreviewPanel(self.mtm()) } {
-                    panel.orderOut(None);
+                    self.order_out(&panel);
                 }
                 self.notify_closed();
             }
@@ -74,7 +75,7 @@ define_class!(
                 panel.setDataSource(None);
                 panel.setDelegate(None);
             }
-            if self.ivars().active.get() && panel.isVisible() { panel.orderOut(None); }
+            if self.ivars().active.get() && panel.isVisible() { self.order_out(panel); }
             self.notify_closed();
         }
     }
@@ -93,6 +94,7 @@ define_class!(
     unsafe impl NSWindowDelegate for PreviewController {
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
+            self.ivars().closing.set(true);
             self.notify_closed();
         }
     }
@@ -102,8 +104,7 @@ define_class!(
         unsafe fn handle_event(&self, panel: Option<&QLPreviewPanel>, event: Option<&NSEvent>) -> bool {
             if event.is_some_and(is_close_key) {
                 if !event.unwrap().isARepeat() {
-                    if let Some(panel) = panel { panel.close(); }
-                    self.notify_closed();
+                    if let Some(panel) = panel { self.close_panel(panel); }
                 }
                 true
             } else { false }
@@ -112,6 +113,21 @@ define_class!(
 );
 
 impl PreviewController {
+    fn order_out(&self, panel: &QLPreviewPanel) {
+        if !self.ivars().closing.replace(true) {
+            panel.orderOut(None);
+        }
+    }
+
+    fn close_panel(&self, panel: &QLPreviewPanel) {
+        // Quick Look animates close asynchronously. A second close/orderOut
+        // during that transition can reverse it and leave the panel visible.
+        // Keep the session alive until windowWillClose/endPreviewPanelControl.
+        if !self.ivars().closing.replace(true) {
+            panel.close();
+        }
+    }
+
     fn notify_closed(&self) {
         if self.ivars().active.replace(false) {
             let callback = self.ivars().on_close.borrow_mut().take();
@@ -171,6 +187,7 @@ pub fn show(
         window: window.clone(),
         active: Cell::new(true),
         controlled: Cell::new(false),
+        closing: Cell::new(false),
         on_close: RefCell::new(Some(on_close)),
     });
     let controller: Retained<PreviewController> = unsafe { msg_send![super(controller), init] };
@@ -211,8 +228,7 @@ pub fn show(
             && is_close_key(event_ref)
         {
             if !event_ref.isARepeat() {
-                target.close();
-                owner.notify_closed();
+                owner.close_panel(&target);
             }
             std::ptr::null_mut()
         } else {
@@ -281,7 +297,7 @@ pub fn close(id: Option<&str>) {
             if s.controller.ivars().controlled.replace(false) {
                 s.panel.setDataSource(None);
                 s.panel.setDelegate(None);
-                s.panel.orderOut(None);
+                s.controller.order_out(&s.panel);
             }
             if s.window.nextResponder().as_deref() == Some(&*s.controller) {
                 s.window.setNextResponder(s.previous.as_deref());

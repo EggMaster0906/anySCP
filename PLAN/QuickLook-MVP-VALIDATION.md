@@ -123,3 +123,14 @@
 3. 需要正式發布時，再處理 DMG 與原有 release 簽章流程。
 
 重跑命令與合成 fixture 說明見 [tests/quicklook/README.md](../tests/quicklook/README.md)。
+
+## 2026-10-30：空白鍵關閉閃爍修正
+
+- 人工回報再次按 Space 時，面板閃爍後仍保持開啟。擴充原生 probe，送出 KeyDown／KeyUp，並在原生關閉 callback 後立即從背景執行緒派送 `macos::close`，以符合正式 manager 的清理時序。原有 probe 延後到可見性斷言後才清理，沒有覆蓋此情境。
+- 修正前以此時序重現 `closed/control-loss panel must be hidden` 失敗：`panel.close()` 後面板仍在關閉動畫中，cleanup 再次 `orderOut()` 會干擾該轉場。控制權轉移的路徑也有重複 order-out。
+- 原生 controller 新增 closing 狀態，使關閉／隱藏只啟動一次；Space／Esc 等待 `windowWillClose` 或控制權結束通知才發出關閉 callback。
+- 修正後 TXT、合成 WAV 各通過 20 次真實面板循環，涵蓋 Space／Esc／關閉按鈕／另一視窗取得 main／立即清理；使用者後續人工複測確認本次 Quick Look 問題已修復。此結果不代表其餘完整人工驗收項目均已完成。
+- `pnpm test`：34 files／201 tests 通過；`pnpm build` 通過（既有 chunk warnings）。`cargo test`：229 通過、5 個需協定 fixture 的測試略過；`cargo clippy --all-targets -- -D warnings`、格式及 diff 檢查通過。
+- `pnpm tauri build --debug --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'` 通過，更新 `src-tauri/target/debug/bundle/macos/anySCP.app`，供人工複測。
+- 暫存策略未新增跨次快取：`app_cache_dir()/quicklook-v1/<run UUID>/<preview UUID>/檔名`，面板解除引用、writer 結束後刪除該次 preview 目錄，失敗時重試／下次啟動清理；run 與 owner lock 保留至程式結束，root 與 sweep lock 可持續保留。重開同檔重新下載符合原 MVP 設計。
+- 此項獨立修正不代表上方連結的 Code Review 中 R1～R6 已處理。
